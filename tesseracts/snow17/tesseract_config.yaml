@@ -6,9 +6,11 @@ version: "0.1.0"
 description: >
   Differentiable Snow-17 (NOAA-OWP, Apache-2.0) wrapped for Tesseract.
   apply() runs EXSNOW19 over a daily time series for one HRU via
-  fortran/snow17_shim.f90; vector_jacobian_product() computes gradients
-  w.r.t. the 11 learnable scalar parameters by forward-difference finite
-  differences over full rollouts.
+  fortran/snow17_shim.f90; jacobian_vector_product() (forward mode) and
+  vector_jacobian_product() (reverse mode) both compute derivatives
+  w.r.t. the 11 learnable scalar parameters via tesseract-core's
+  experimental finite-difference helpers over full rollouts. The coupled
+  pipeline drives forward mode.
 
 env:
   # Matches tesseract_api.py's _REPO_ROOT fallback logic -- see the

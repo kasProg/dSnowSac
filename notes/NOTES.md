@@ -201,57 +201,67 @@ paste our patch or any other project code). Not yet filed.
 
 ---
 
-## Writeup material: why we bypass tesseract-torch's automatic composition
+## Writeup material: why forward-mode AD across the two Tesseracts
 
 Criterion 5 (execution and technical depth) material — draft paragraph
-below, written while the reasoning is fresh from building
-`src/coupling.py`. Not yet polished for the actual submission writeup,
-but the substance shouldn't change.
+below. Not yet polished for the actual submission writeup, but the
+substance shouldn't change.
 
 **Draft:**
 
-> Composing two Tesseracts through PyTorch's autograd is normally
-> automatic: `tesseract-torch`'s `apply_tesseract()` registers each
-> Tesseract as its own graph node, and a chained `.backward()` calls each
-> node's `vector_jacobian_product` in reverse order, passing the
-> downstream node's gradient as the upstream node's cotangent. We don't
-> use that path for the Snow17→SAC-SMA edge. Standard composition would
-> require SAC-SMA's Tesseract to expose `d(runoff)/d(RAIM)` — a
-> vector-Jacobian product with respect to its own input, which for a
-> multi-year run is a several-thousand-element daily time series, not a
-> handful of scalars. Our Jacobians come from finite differences, and FD
-> cost scales with the dimensionality of what's being differentiated —
-> so that one VJP alone would cost one perturbed SAC-SMA run per RAIM
-> timestep. For a 10-year daily run, roughly 3,650 runs, for a single
-> gradient step. We instead compute Snow17's parameter gradients as an
-> end-to-end VJP across both containers at once (perturb one Snow17
-> parameter, rerun both models, read how the resulting runoff series
-> moved, dot against the incoming cotangent) inside a single custom
-> `torch.autograd.Function` (`src/coupling.py`), never materializing
-> `d(runoff)/d(RAIM)` as an object. This drops the cost for Snow17's ~13
-> parameters to roughly 26–52 model-run pairs per gradient (depending on
-> forward vs. central differencing) instead of thousands, while SAC-SMA's
-> own ~16 parameters remain cheap and ordinary (RAIM held fixed, SAC-SMA
-> reruns alone). The tradeoff, stated plainly: the composition boundary
-> between the two Tesseracts is not fully generic — the gradient path for
-> Snow17's parameters has to know SAC-SMA exists, via this one hand-written
-> coupling layer, rather than falling out for free from two independently
-> reusable containers. We judged that an honest, disclosed cost of this
-> composition, not something to hide, and validated the mechanism against
-> autograd ground truth and an independently-implemented brute-force check
-> on cheap stand-ins before wiring it to the real models
-> (`tests/test_coupling_toy.py`) — see notes/logs.md.
+> Two Tesseracts compose through PyTorch's autograd via
+> `tesseract-torch`'s `apply_tesseract()`, which registers each as its
+> own graph node. The question is which direction to differentiate. The
+> hard object is `d(runoff)/d(RAIM)`: Snow17's parameters reach the loss
+> only through RAIM, and for a multi-year daily run RAIM is a
+> several-thousand-element time series. A reverse-mode composition would
+> ask SAC-SMA for that full Jacobian — and because our Jacobians come
+> from finite differences, whose cost scales with the dimensionality of
+> what's being differentiated, building it would cost one perturbed
+> SAC-SMA run per RAIM timestep: roughly 3,650 runs for a single gradient
+> step. Forward mode never forms it. We seed a tangent on each parameter,
+> Snow17's `jacobian_vector_product` turns it into a *tangent* on RAIM (a
+> single vector), and SAC-SMA's `jacobian_vector_product` consumes that
+> vector and returns a runoff tangent — the wide intermediate is only
+> ever carried as a tangent, never as a matrix. `tesseract-torch` chains
+> the two endpoints automatically under `torch.autograd.forward_ad`, so
+> the entire cross-container gradient path is Tesseract's own machinery;
+> there is no hand-written coupling code. The endpoints themselves are
+> thin wrappers over tesseract-core's experimental finite-difference
+> helpers (`finite_difference_jvp` / `finite_difference_vjp`) — we supply
+> per-parameter step sizes (relative-with-floor, since the parameters span
+> orders of magnitude) and, for SAC-SMA's `pcp` forcing, a step sized to
+> the incoming tangent so the directional derivative stays inside the
+> local-linear regime through the model's storage-full kinks. So even the
+> per-model numerics are Tesseract's, not ours. Forward mode is the right mode
+> here on first principles: few inputs (27 parameters), one wide
+> intermediate flux, a scalar loss — its cost is one pass per parameter,
+> independent of series length. The one seam we own is small and
+> unavoidable: forward mode differentiates the physics, but the parameters
+> come from a network that trains by reverse mode, and the two modes don't
+> fuse into a single `.backward()`. `src/coupling.py` bridges them —
+> forward-mode AD over the two Tesseracts builds the parameter Jacobian
+> `d(runoff)/d(theta)` (27 columns, one dual-level pass each), and returns
+> runoff as an ordinary autograd tensor carrying it, so a downstream
+> `loss(runoff).backward()` flows on into the network by normal reverse
+> mode. We validated the composition against autograd ground truth and an
+> independently-implemented brute-force finite difference — on cheap torch
+> stand-ins first (`tests/test_coupling_toy.py`), then on the real
+> Fortran chain (`tests/test_pipeline_hhwm8.py`), plus a JVP/VJP adjoint-
+> identity check on each Tesseract (`tests/test_gradients.py`).
 
 **Where this evidence lives, for citing in the writeup:**
-- The FD-cost argument itself (why merged/naive-split were rejected):
-  CLAUDE.md's "Finite-difference cost analysis" section.
-- The mechanism's design and the three-way validation (autograd ground
-  truth + independent brute-force FD at a different step size + a
-  structural call-count proof that RAIM never re-triggers Snow17 on the
-  cheap parameter block): `notes/logs.md`, "`src/coupling.py`:
-  cross-container gradient coupling, prototyped first."
-- The actual code: `src/coupling.py` (`CoupledTwoStageFunction`),
-  `tests/test_coupling_toy.py`.
+- Why forward mode beats reverse here (the FD-cost / dimensionality
+  argument): CLAUDE.md's "Finite-difference cost analysis" section and
+  `src/coupling.py`'s module docstring.
+- The mechanism's design and validation (autograd ground truth +
+  independent brute-force FD + the adjoint-identity JVP/VJP check + a
+  per-parameter evaluation-count proof that the dense d(runoff)/d(RAIM)
+  Jacobian is never materialized): `tests/test_coupling_toy.py`,
+  `tests/test_gradients.py`, `tests/test_pipeline_hhwm8.py`.
+- The actual code: `src/coupling.py` (`run_physics`), `src/pipeline.py`
+  (the `apply_tesseract` chain), and each `tesseract_api.py`'s
+  `jacobian_vector_product`.
 
 ---
 

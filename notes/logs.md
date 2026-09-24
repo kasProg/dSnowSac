@@ -1493,3 +1493,119 @@ the main `README.md`, `results/compare_runs.py`'s example usage, and
 point at `model_9yrs_spatial/` -- the numbers cited everywhere were
 already this run's numbers, so no figure changed, only which directory
 name and which files back them.
+
+---
+
+## 2026-09-22 — Coupling switched from custom reverse-mode Function to forward-mode Tesseract composition
+
+**What:** Replaced `CoupledTwoStageFunction` (the "option 1.5"
+reverse-mode `torch.autograd.Function` that hand-rolled the
+cross-container gradient) with forward-mode automatic differentiation
+over the two Tesseracts. Each `tesseract_api.py` now also implements
+`jacobian_vector_product` (forward mode) alongside its existing
+`vector_jacobian_product`; SAC-SMA's `pcp` forcing became a
+`Differentiable` input so the RAIM tangent can flow into it.
+`src/coupling.py` is now `run_physics` — it seeds a unit tangent on each
+of the 27 parameters, runs the `apply_tesseract(snow17) ->
+apply_tesseract(sacsma)` chain under `torch.autograd.forward_ad`, and
+reads each runoff tangent as one column of `d(runoff)/d(theta)`, then
+hands runoff back as an ordinary autograd tensor carrying that Jacobian
+so a downstream `loss.backward()` reaches the network. `src/pipeline.py`
+lost its hand-written `_stage_*`/`_make_vjp_sacsma` numpy plumbing;
+the composition is now Tesseract's own.
+
+**Why:** The old design achieved the right *cost* (avoid the dense
+`d(runoff)/d(RAIM)` Jacobian) but did it with bespoke code that had to
+explain, at length, why no single Tesseract's VJP could span the
+downstream container. Forward mode is the textbook-correct framing for
+this graph — few inputs, one wide intermediate flux, scalar loss — and
+tesseract-torch already dispatches PyTorch forward-mode AD to the
+`jacobian_vector_product` endpoints and chains them across the container
+boundary automatically. So the cross-container gradient path is now the
+framework's own machinery, not ours. Same evaluation count as before
+(one pass per parameter); the win is a cleaner narrative and the deletion
+of the entire hand-rolled coupling layer, not speed.
+
+**The one seam that remains:** forward mode differentiates the physics,
+but the parameters come from a network that trains by reverse mode, and
+the two modes don't fuse in a single `.backward()`. `run_physics` bridges
+them via a thin `_PhysicsRunoff` autograd Function: forward-mode builds
+the parameter Jacobian, reverse-mode contracts it against the loss
+gradient and flows into the network. Documented in `src/coupling.py`'s
+module docstring.
+
+**Validation:** `tests/test_coupling_toy.py` rewritten to check
+`run_physics` against autograd ground truth (rtol 1e-6) and an
+independent brute-force FD, plus an evaluation-count assertion proving
+the dense RAIM Jacobian is never materialized (physics called exactly
+len(A)+len(B) times). `tests/test_gradients.py` gained JVP/VJP
+adjoint-identity checks (`<u, J@e> == (J^T@u)[p]`), a JVP-linearity
+check, and — the load-bearing one — a directional-derivative check of
+SAC-SMA's `pcp` JVP against an independent central FD, plus a
+forward-mode-chaining proof that a `pcp` dual tangent survives
+`apply_tesseract`. `tests/test_pipeline_hhwm8.py` now checks the coupled
+forward-mode gradient against a brute-force FD through both real Fortran
+models (5% tolerance — a float32-Snow17 FD-vs-FD comparison; a sign flip
+or dropped tangent misses by >100%). Full suite: 78 passed, 5 skipped
+(Docker/CAMELS-gated).
+
+**One subtlety found and fixed:** the `pcp` directional derivative
+initially used a large one-sided FD step and disagreed with a converged
+reference at a few timesteps — SAC-SMA's storage-full/percolation
+conditionals are kinks in `pcp`, and a large step secants across them.
+Switched that path to a small central difference (stable to ~1e-8 across
+step sizes); the scalar parameters keep the cheaper one-sided step. Same
+class of hard-threshold issue already documented for Snow-17's PXTEMP.
+
+
+---
+
+## 2026-09-22 (later) — FD endpoints now delegate to tesseract-core experimental helpers
+
+**What:** Replaced the hand-rolled finite-difference code inside both
+`tesseract_api.py` files (`_scalar_column`, `_param_column`,
+`_pcp_directional_derivative`, the accumulation loops) with
+tesseract-core's experimental helpers,
+`tesseract_core.runtime.experimental.finite_difference_jvp` and
+`finite_difference_vjp`. Each endpoint is now a few lines: build a
+per-input `eps` mapping and call the helper. ~120 lines of bespoke
+numerics deleted across the two files.
+
+**Why:** They're a drop-in for exactly what we wrote, they get maintained
+upstream, and leaning on them strengthens the "leverage Tesseract's own
+features" story. Notably `finite_difference_jvp` already implements the
+directional-derivative trick (perturb along the tangent, one central pair,
+O(1) rollouts regardless of series length) that the `pcp`/RAIM coupling
+depends on — so the piece I was most careful about by hand is the helper's
+default behavior.
+
+**Two things we had to supply, not accept as default:**
+1. *Relative step sizes.* The helpers take `eps` as an ABSOLUTE
+   perturbation (a scalar applied unscaled to every input). Snow17/SAC-SMA
+   parameters span orders of magnitude (SI ~1500 next to MBASE ~0; UZTWM
+   ~100 next to LZPK ~0.01), so we pass a per-path `eps` mapping built from
+   the old relative-with-floor `_fd_step`. The helper validates that the
+   mapping names every differentiated path and no others — a typo is an
+   error, not a silent fallback.
+2. *pcp directional step.* `finite_difference_jvp` perturbs `pcp + eps *
+   tangent`; we size `eps` to `1e-4 * ||pcp|| / ||tangent||` so the
+   effective step matches the series magnitude regardless of the incoming
+   tangent's norm (`_pcp_eps`). Same small-central-difference reasoning as
+   before — SAC-SMA's storage-full kinks — just expressed as an eps rather
+   than a hand-written central difference.
+
+**Algorithm change:** everything is now central difference (the helper
+default), including the VJP, which was previously one-sided forward. More
+accurate; the only fallout was the two `test_*_vjp_matches_manual_perturbation`
+tests, which compared against a manual FORWARD difference — updated to a
+central difference through `apply()` (still an independent recomputation,
+just matching the endpoint's algorithm).
+
+**Caveat, stated plainly:** these helpers are marked experimental ("API
+may change in future releases"). We depend on the per-path `eps` mapping
+and the JVP directional-derivative behavior. If a future tesseract-core
+bumps that API, these six endpoint functions are where it lands — small
+and well-tested. Judged worth it for the code deletion and the cleaner
+framing; the full gradient test suite (incl. the coupled brute-force-FD
+check through both real Fortran models) is the safety net and stays green
+(78 passed, 5 skipped).

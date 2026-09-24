@@ -1,213 +1,166 @@
-"""Cross-container gradient coupling for the Snow17 -> SAC-SMA chain.
+"""Forward-mode bridge across the Snow17 -> SAC-SMA Tesseract chain.
 
-Implemented as a single custom `torch.autograd.Function` rather than two
-separately-composed Tesseract VJPs. See notes/NOTES.md for the full cost
-argument; short version:
+The pipeline is:
 
-Standard composition (`apply_tesseract(A)` piped into `apply_tesseract(B)`,
-then `.backward()`) asks Tesseract B for `d(runoff)/d(RAIM)` -- a
-Jacobian-vector product with respect to a several-thousand-element daily
-time series. Our VJPs are finite-difference, and FD cost scales with the
-dimensionality of what's being differentiated, not the output -- so that
-VJP alone would cost one perturbed SAC-SMA run per RAIM timestep
-(thousands of runs). Intractable.
+    theta_A, theta_B  (predicted by a PyTorch network)
+        -> [Snow17 Tesseract]  --RAIM-->  [SAC-SMA Tesseract]
+        -> runoff  ->  scalar loss (NSE) vs. observed streamflow
 
-This avoids ever materializing that object. theta_A's (Snow17's)
-gradient is computed by perturbing each Snow17 parameter, running BOTH
-stages, and reading how the resulting *runoff* series moved -- an
-end-to-end VJP that only costs one A+B run pair per parameter. theta_B's
-(SAC-SMA's) gradient is cheap and ordinary: RAIM is held fixed at its
-cached base value and only stage B reruns.
+Both models are compiled Fortran wrapped as Tesseracts whose derivatives
+come from finite differences (see each tesseract_api.py). The question is
+only how to compose them into PyTorch's autograd graph.
 
-Both blocks are computed inside ONE Function's backward(), sharing one
-ctx cache of the base forward pass. theta_A's block has no honest
-alternative to the hand-rolled FD sweep below -- it needs stage_a rerun,
-which no single Tesseract's own vector_jacobian_product() can do (that
-endpoint only differentiates ITS OWN apply(), not a downstream
-container). theta_B's block is different: RAIM is held fixed and never
-recomputed, so it needs nothing stage_b's own Tesseract doesn't already
-offer through its own vector_jacobian_product() endpoint (FD-based,
-identically cheap -- one perturbed rollout per parameter, no per-RAIM-
-timestep cost). CoupledNWSStack (pipeline.py) passes an optional `vjp_b`
-callable wired to that real endpoint; when present, backward() calls it
-instead of reimplementing the same sweep here. `vjp_b=None` (the toy
-tests, and any caller without a real Tesseract handy) falls back to the
-hand-rolled block, so both paths are exercised and kept honest against
-each other -- see tests/test_pipeline_hhwm8.py's
-test_sacsma_vjp_matches_fd_fallback.
+Why forward mode. Snow17's parameters reach runoff only through RAIM, a
+full daily time series (~thousands of values). A reverse-mode composition
+would ask SAC-SMA for d(runoff)/d(RAIM) -- a dense n x n Jacobian against
+that intermediate flux, which finite differences can only build one
+column per rollout: thousands of rollouts. Forward mode never forms it.
+It seeds a tangent on a parameter, Snow17's jacobian_vector_product turns
+it into a RAIM *tangent* (one vector), and SAC-SMA's jacobian_vector_product
+consumes that vector and returns a runoff tangent -- a constant number of
+rollouts, independent of series length. This is the natural mode here:
+few inputs (27 parameters), one wide intermediate, a scalar output.
+
+tesseract-torch already dispatches PyTorch forward-mode AD
+(torch.autograd.forward_ad dual tensors) to each Tesseract's
+jacobian_vector_product endpoint, and chains the two automatically when
+one's differentiable output feeds the other's differentiable input. So
+the composition itself is `apply_tesseract(snow17) -> apply_tesseract(sacsma)`
+under a dual_level context, with no hand-written cross-container gradient
+code. src/pipeline.py builds that chain as a `physics(theta_A, theta_B)
+-> runoff` callable.
+
+The one seam this module owns. Forward mode differentiates the physics;
+theta is produced by a network that trains by reverse mode. run_physics()
+below builds the parameter Jacobian J = d(runoff)/d(theta) one column at a
+time by forward-mode AD over the Tesseract chain (27 columns, each one
+dual-level pass), then hands runoff back as an ordinary autograd tensor
+carrying J. Downstream, `loss(runoff).backward()` contracts J against
+d(loss)/d(runoff) by normal reverse mode and flows on into the network.
+Forward mode across the physics, reverse mode across the network and the
+loss, joined at runoff -- and the loss stays plain PyTorch, outside this
+module.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable
 
-import numpy as np
 import torch
+import torch.autograd.forward_ad as fwAD
 
-# A "stage" is a black-box, non-torch-differentiable forward call -- in
-# production this is a Tesseract's apply(), in tests/test_coupling_toy.py
-# it's a cheap numpy stand-in. Signature: stage(theta_np, upstream) -> output_np.
-Stage = Callable[[np.ndarray, object], np.ndarray]
+# A "physics" callable maps the two parameter vectors to a runoff tensor by
+# chaining the two Tesseracts. It must be built from apply_tesseract so that,
+# under a forward_ad.dual_level() context, dual tensors passed in carry their
+# tangents through both jacobian_vector_product endpoints. src/pipeline.py's
+# CoupledNWSStack builds the real one; tests pass cheap stand-ins.
+# Signature: physics(theta_A, theta_B) -> runoff, all torch tensors.
+Physics = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-@dataclass
-class FDConfig:
-    """Per-parameter finite-difference step: eps_i = max(rel * |theta_i|, floor).
+def _parameter_jacobian(
+    physics: Physics,
+    theta_A: torch.Tensor,
+    theta_B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Runoff and its Jacobian columns w.r.t. each parameter, by
+    forward-mode AD over the physics chain.
 
-    rel/floor may be scalars (applied uniformly) or per-parameter arrays --
-    real Snow17/SAC-SMA parameters span very different scales (e.g. UZTWM
-    ~O(100) mm vs UZK ~O(0.1)), so a single fixed eps is simultaneously too
-    coarse for small parameters and too fine (noise-dominated) for large
-    ones. `central=True` uses (f(x+eps)-f(x-eps))/2eps, which kills the
-    leading (O(eps)) truncation term that a forward difference carries --
-    worth the extra evaluation per parameter given float32 (Snow17) noise.
+    One dual-level pass per parameter: seed a unit tangent on that single
+    parameter, run physics, and read runoff's output tangent -- exactly
+    d(runoff)/d(that parameter), one length-n column. len(theta_A) +
+    len(theta_B) passes total, independent of series length; the wide RAIM
+    intermediate is only ever carried as a tangent vector between the two
+    Tesseracts, never materialized as a Jacobian.
+
+    Returns (runoff_primal, J_A, J_B) with J_A of shape (n, len(theta_A))
+    and J_B of shape (n, len(theta_B)). runoff_primal is detached; the
+    caller re-attaches autograd through _PhysicsRunoff.
     """
+    n_a, n_b = theta_A.numel(), theta_B.numel()
+    zero_A = torch.zeros_like(theta_A)
+    zero_B = torch.zeros_like(theta_B)
 
-    rel: float | np.ndarray = 1e-3
-    floor: float | np.ndarray = 1e-4
-    central: bool = True
+    def unit(theta: torch.Tensor, i: int) -> torch.Tensor:
+        e = torch.zeros_like(theta)
+        e[i] = 1.0
+        return e
 
-    def steps(self, theta: np.ndarray) -> np.ndarray:
-        return np.maximum(np.abs(theta) * self.rel, self.floor)
+    cols_A: list[torch.Tensor] = []
+    cols_B: list[torch.Tensor] = []
+    runoff_primal: torch.Tensor | None = None
+
+    for i in range(n_a):
+        with fwAD.dual_level():
+            runoff = physics(fwAD.make_dual(theta_A, unit(theta_A, i)), fwAD.make_dual(theta_B, zero_B))
+            primal, tangent = fwAD.unpack_dual(runoff)
+            cols_A.append(tangent.detach().clone() if tangent is not None else torch.zeros_like(primal))
+            if runoff_primal is None:
+                runoff_primal = primal.detach().clone()
+
+    for j in range(n_b):
+        with fwAD.dual_level():
+            runoff = physics(fwAD.make_dual(theta_A, zero_A), fwAD.make_dual(theta_B, unit(theta_B, j)))
+            _primal, tangent = fwAD.unpack_dual(runoff)
+            cols_B.append(tangent.detach().clone() if tangent is not None else torch.zeros_like(_primal))
+
+    assert runoff_primal is not None  # theta_A always has >= 1 parameter
+    J_A = torch.stack(cols_A, dim=1)  # (n, n_a)
+    J_B = torch.stack(cols_B, dim=1)  # (n, n_b)
+    return runoff_primal, J_A, J_B
 
 
-class CoupledTwoStageFunction(torch.autograd.Function):
-    """Couples stage_a -> stage_b (A's output feeds B) as one autograd node.
+class _PhysicsRunoff(torch.autograd.Function):
+    """Re-attaches autograd to a forward-mode-computed runoff.
 
-    forward(theta_A, theta_B, forcings, stage_a, stage_b, fd_a, fd_b, vjp_b) -> output_b
+    forward(theta_A, theta_B, J_A, J_B, runoff_primal) -> runoff
 
-    theta_A, theta_B: torch tensors (leaves predicted by the upstream
-    network), differentiated by this Function.
-    forcings: passed through to stage_a unchanged; never differentiated.
-    stage_a, stage_b, fd_a, fd_b, vjp_b: plain Python objects
-    (callables/config), not tensors -- torch.autograd.Function accepts
-    non-tensor forward args positionally; backward must return None for
-    each of their slots. vjp_b is REQUIRED at every call site (pass
-    `None` explicitly to use the FD fallback) -- it is not given a
-    Python-level default, because torch.autograd.Function's backward
-    must return exactly as many values as forward received positional
-    args at that specific .apply() call, and a default silently omitted
-    at one call site but not another would desync that count.
+    The primal and its parameter Jacobians J_A = d(runoff)/d(theta_A),
+    J_B = d(runoff)/d(theta_B) are computed outside (by _parameter_jacobian's
+    forward-mode passes) and passed in. backward() contracts the incoming
+    runoff cotangent against those Jacobians -- grad_theta = J^T @ g_runoff
+    -- giving each parameter leaf its gradient in its own dtype. J_A/J_B
+    are non-tensor-leaf autograd inputs only in the sense that they carry
+    no grad themselves; backward returns None for their slots.
     """
 
     @staticmethod
-    def forward(ctx, theta_A, theta_B, forcings, stage_a, stage_b, fd_a, fd_b, vjp_b):
-        theta_A_np = theta_A.detach().cpu().numpy().astype(np.float64)
-        theta_B_np = theta_B.detach().cpu().numpy().astype(np.float64)
-
-        output_a = stage_a(theta_A_np, forcings)
-        assert not torch.is_tensor(output_a), (
-            "stage_a must return a plain array, not a torch tensor -- "
-            "if this fires, RAIM would carry an autograd graph edge and "
-            "the whole point of this Function (avoiding the expensive "
-            "standard composition) is defeated."
-        )
-        output_b = stage_b(theta_B_np, output_a)
-        assert not torch.is_tensor(output_b)
-
-        # Cached for backward(). Scoped to exactly one forward/backward
-        # pair -- this IS the object's lifetime, no separate cache needed.
-        ctx.stage_a = stage_a
-        ctx.stage_b = stage_b
-        ctx.fd_a = fd_a
-        ctx.fd_b = fd_b
-        ctx.vjp_b = vjp_b
-        ctx.theta_A_np = theta_A_np
-        ctx.theta_B_np = theta_B_np
-        ctx.forcings = forcings
-        ctx.output_a_base = output_a  # RAIM, held fixed for the theta_B block
-        ctx.output_b_base = output_b  # runoff, reused by forward-difference mode
-        # theta_A and theta_B are NOT assumed to share a dtype/device --
-        # in the real integration Snow17 is float32 and SAC-SMA is
-        # float64 (see notes/NOTES.md). Each gradient must be cast back
-        # to its OWN leaf's original dtype/device, not the other's --
-        # tests/test_coupling_toy.py used float64 for both blocks, which
-        # silently masked this until the real wrappers were wired in
-        # (see notes/logs.md).
+    def forward(ctx, theta_A, theta_B, J_A, J_B, runoff_primal):
+        ctx.save_for_backward(J_A, J_B)
         ctx.theta_A_dtype, ctx.theta_A_device = theta_A.dtype, theta_A.device
         ctx.theta_B_dtype, ctx.theta_B_device = theta_B.dtype, theta_B.device
-
-        # Output dtype: float64 always, matching the last stage's (SAC-SMA)
-        # true computational precision, independent of either theta's
-        # dtype -- not tied to theta_A's dtype, which would silently
-        # truncate the forward pass's own fidelity whenever theta_A
-        # happens to be float32. np.array(..., copy=True) rather than
-        # torch.as_tensor directly on output_b: some real stage_b
-        # implementations (e.g. ctypes-backed ones) can return read-only
-        # or externally-owned buffers, which torch.as_tensor would wrap
-        # without copying -- undefined behavior if anything downstream
-        # writes into it. Cheap insurance, not a hot path.
-        return torch.as_tensor(np.array(output_b, copy=True), dtype=torch.float64)
+        return runoff_primal
 
     @staticmethod
-    def backward(ctx, grad_output):
-        grad_output_np = grad_output.detach().cpu().numpy().astype(np.float64)
-
-        grad_theta_A = _fd_vjp_block(
-            theta=ctx.theta_A_np,
-            fd=ctx.fd_a,
-            grad_output=grad_output_np,
-            run=lambda theta_perturbed: ctx.stage_b(
-                ctx.theta_B_np, ctx.stage_a(theta_perturbed, ctx.forcings)
-            ),
-            base_output=ctx.output_b_base,
+    def backward(ctx, grad_runoff):
+        J_A, J_B = ctx.saved_tensors
+        # Contract in each Jacobian's own dtype (J_A is float32, J_B float64),
+        # then land each gradient on its parameter leaf's dtype/device.
+        grad_A = (J_A.transpose(0, 1) @ grad_runoff.to(J_A.dtype)).to(
+            dtype=ctx.theta_A_dtype, device=ctx.theta_A_device
         )
-
-        if ctx.vjp_b is not None:
-            # theta_B never needs stage_a rerun (RAIM held at the cached
-            # base) -- so, unlike theta_A, there is no FD-cost reason to
-            # avoid stage_b's own Tesseract vector_jacobian_product()
-            # endpoint. vjp_b (built by pipeline.py's CoupledNWSStack)
-            # wraps exactly that call.
-            grad_theta_B = ctx.vjp_b(ctx.theta_B_np, ctx.output_a_base, grad_output_np)
-        else:
-            grad_theta_B = _fd_vjp_block(
-                theta=ctx.theta_B_np,
-                fd=ctx.fd_b,
-                grad_output=grad_output_np,
-                # RAIM held at the cached base -- stage_a is NEVER called here.
-                run=lambda theta_perturbed: ctx.stage_b(theta_perturbed, ctx.output_a_base),
-                base_output=ctx.output_b_base,
-            )
-
-        grad_theta_A_t = torch.as_tensor(grad_theta_A, dtype=ctx.theta_A_dtype, device=ctx.theta_A_device)
-        grad_theta_B_t = torch.as_tensor(grad_theta_B, dtype=ctx.theta_B_dtype, device=ctx.theta_B_device)
-        return grad_theta_A_t, grad_theta_B_t, None, None, None, None, None, None
+        grad_B = (J_B.transpose(0, 1) @ grad_runoff.to(J_B.dtype)).to(
+            dtype=ctx.theta_B_dtype, device=ctx.theta_B_device
+        )
+        return grad_A, grad_B, None, None, None
 
 
-def _fd_vjp_block(
-    theta: np.ndarray,
-    fd: FDConfig,
-    grad_output: np.ndarray,
-    run: Callable[[np.ndarray], np.ndarray],
-    base_output: np.ndarray,
-) -> np.ndarray:
-    """One parameter block's VJP: for each theta[i], perturb, rerun the
-    (possibly multi-stage) pipeline via `run`, and dot the resulting
-    change in output against the incoming cotangent. This is what makes
-    it an honest VJP rather than a loss-specific gradient: `run` returns
-    the full output series, and the cotangent contraction happens here,
-    not baked into what gets finite-differenced.
+def run_physics(
+    physics: Physics,
+    theta_A: torch.Tensor,
+    theta_B: torch.Tensor,
+) -> torch.Tensor:
+    """Run the coupled Snow17 -> SAC-SMA chain and return runoff as an
+    autograd tensor differentiable w.r.t. theta_A and theta_B.
 
-    `base_output` is the pipeline's cached unperturbed output -- reused
-    directly by forward-difference mode instead of recomputing it once
-    per parameter."""
-    steps = fd.steps(theta)
-    grad = np.zeros_like(theta)
-    for i in range(len(theta)):
-        eps = steps[i]
-        theta_plus = theta.copy()
-        theta_plus[i] += eps
-        out_plus = run(theta_plus)
-
-        if fd.central:
-            theta_minus = theta.copy()
-            theta_minus[i] -= eps
-            out_minus = run(theta_minus)
-            d_output = (out_plus - out_minus) / (2.0 * eps)
-        else:
-            d_output = (out_plus - base_output) / eps
-
-        grad[i] = np.dot(grad_output, d_output)
-    return grad
+    Physics derivatives come from forward-mode AD over the two Tesseracts
+    (see _parameter_jacobian); the returned tensor carries them so an
+    ordinary downstream `loss(runoff).backward()` reaches both parameter
+    leaves and, above them, the network. J is computed once here regardless
+    of what loss the caller applies.
+    """
+    runoff_primal, J_A, J_B = _parameter_jacobian(physics, theta_A.detach(), theta_B.detach())
+    J_A = J_A.to(dtype=theta_A.dtype, device=theta_A.device)
+    J_B = J_B.to(dtype=theta_B.dtype, device=theta_B.device)
+    runoff_primal = runoff_primal.to(dtype=theta_B.dtype, device=theta_B.device)
+    return _PhysicsRunoff.apply(theta_A, theta_B, J_A, J_B, runoff_primal)

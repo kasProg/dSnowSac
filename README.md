@@ -66,33 +66,55 @@ flowchart LR
     PET["PET"] --> T2
     T2 --> SIM["Simulated<br/>streamflow"] --> LOSS["NSE loss vs.<br/>observed streamflow"]
 
-    LOSS -. "θ_B: SAC-SMA's own VJP" .-> NET
-    LOSS -. "θ_A: perturb + rerun both models" .-> NET
+    LOSS -. "∂loss/∂θ (forward-mode AD)" .-> NET
 ```
 
-Solid arrows are the forward pass. The two dashed arrows are
-gradients, and they are deliberately not symmetric. θ_B's gradient
-uses SAC-SMA's own Tesseract VJP endpoint directly. θ_A's cannot:
-Snow-17's parameters reach the loss only through RAIM, which has thousands of  daily values. No Tesseract's VJP can differentiate a downstream
-container it does not own. So θ_A's gradient perturbs each Snow-17
-parameter, reruns both models, and reads how the final runoff moved.
-RAIM (rain-plus-melt) is the same coupling flux NOAA runs
-operationally from Snow-17 into SAC-SMA, so the container boundary
-sits at a real, existing operational seam.
+Solid arrows are the forward pass; the dashed arrow is the gradient. It
+is computed by **forward-mode** automatic differentiation over the two
+Tesseracts: a tangent is seeded on each parameter, Snow-17's
+`jacobian_vector_product` turns it into a tangent on RAIM, and SAC-SMA's
+`jacobian_vector_product` carries that tangent through to a tangent on
+runoff. `tesseract-torch` chains the two endpoints automatically — the
+RAIM tangent is handed from one container to the next as a single
+vector, never as a matrix. Snow-17 produces RAIM (rain-plus-melt) — the
+same coupling flux NOAA runs operationally into SAC-SMA — so the
+container boundary sits at a real, existing operational seam.
 
-There are two containers rather than one because NOAA maintains
-Snow-17 and SAC-SMA as separate modules. A standalone Snow-17
-Tesseract can be reused with any downstream rainfall-runoff model, not
+## Why Tesseract
+
+PyTorch's `.backward()` walks a recorded graph — Snow-17 and SAC-SMA
+are compiled Fortran, so nothing is recorded and autodiff stops cold.
+Each model is wrapped as its own Tesseract exposing `apply()` and both
+finite-difference derivative endpoints, `jacobian_vector_product()`
+(forward mode) and `vector_jacobian_product()` (reverse mode);
+`tesseract-torch` splices both into the autograd graph as ordinary
+differentiable layers. Two Tesseracts are composed here: NOAA maintains
+Snow-17 and SAC-SMA as separate modules, and a standalone Snow-17
+Tesseract is reusable with any downstream rainfall-runoff model, not
 just this one.
 
-Both containers are gradient-checked end to end. The coupling logic is
-checked first against autograd ground truth and an independent
-brute-force check on cheap stand-ins (`tests/test_coupling_toy.py`),
-then against the real Tesseracts (`tests/test_pipeline_hhwm8.py`,
-`tests/test_gradients.py`). On every push, CI runs `tesseract build`
-for both containers from scratch and smoke-tests `apply()` against the
-built images ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
+**Why forward mode.** Snow-17's parameters reach the loss only through
+RAIM, a full daily time series (~3,650 values). A reverse-mode
+composition would ask SAC-SMA for `d(runoff)/d(RAIM)` — a dense
+Jacobian against that intermediate flux, which finite differences can
+only build one column per model run: thousands of runs. Forward mode
+never forms it. With few inputs (27 parameters), one wide intermediate
+flux, and a scalar loss, forward mode is the natural fit: its cost is
+one pass per parameter (independent of series length), and Tesseract's
+own forward-mode composition carries the RAIM tangent across the
+container boundary for free. The gradient path is entirely Tesseract's
+own machinery — there is no hand-written cross-container gradient code.
+Forward mode differentiates the physics; the upstream network trains by
+ordinary reverse-mode autograd, the two joined at the parameter vector
+(see [src/coupling.py](src/coupling.py)).
 
+Both containers are built and gradient-checked end-to-end — against
+autograd ground truth and an independent brute-force check on cheap
+stand-ins first (`tests/test_coupling_toy.py`), then against the real
+Tesseracts (`tests/test_pipeline_hhwm8.py`, `tests/test_gradients.py`).
+`tesseract build` runs in CI on every push, building both containers
+from scratch and smoke-testing `apply()` against the built images (see
+[.github/workflows/ci.yml](.github/workflows/ci.yml)).
 
 ## Results
 
@@ -129,6 +151,13 @@ line is the USGS gauge and the blue line is the hybrid model. The top
 basin is one of the best held-out fits (NSE 0.82). The bottom one is
 near the median (NSE 0.69): it starts spring melt a little late and
 overshoots the 1997 peak. Regenerate with `results/plot_hydrograph.py`.*
+
+> These numbers are from a run trained under the previous reverse-mode
+> coupling; the gradient path has since been rewritten to forward-mode
+> Tesseract composition (gradient-equivalent, see the test suite). The
+> committed checkpoint still reloads and scores as recorded, but a fresh
+> training run under the current code has not yet been committed — see
+> [results/README.md](results/README.md) for the full note.
 
 For comparison, a properly engineered LSTM
 ([NeuralHydrology](https://github.com/neuralhydrology/neuralhydrology))
@@ -185,11 +214,10 @@ model size, so a GPU would not help. See
 [results/README.md](results/README.md) for saved runs and
 `results/compare_runs.py` for comparing them.
 
-**Docker note:** day-to-day development of `apply()` and
-`vector_jacobian_product()` calls
-`tesseract_core.Tesseract.from_tesseract_api()` directly, with no
-container. The actual `tesseract build` runs in CI, where Docker is
-available.
+**Docker note:** day-to-day `apply()` / `jacobian_vector_product()`
+development runs through `tesseract_core.Tesseract.from_tesseract_api()`
+directly (no container needed); actual `tesseract build` runs in CI,
+where Docker is available.
 
 ## Layout
 
@@ -197,9 +225,9 @@ available.
 external/snow17/, external/sac-sma/   git submodules, pinned commits (Apache-2.0, unmodified)
 patches/                              disclosed, minimal, build-time-only patch to vendored source
 fortran/                              bind(C) shims threading each model's state explicitly
-tesseracts/snow17/, tesseracts/sacsma/  the two Tesseract containers: apply() + finite-difference VJP
-src/coupling.py                       cross-model gradient orchestration
-src/pipeline.py                       wires the real Tesseracts into coupling.py
+tesseracts/snow17/, tesseracts/sacsma/  the two Tesseract containers: apply() + finite-difference JVP/VJP
+src/coupling.py                       forward-mode bridge: physics differentiation -> network autograd
+src/pipeline.py                       chains the two Tesseracts (apply_tesseract) into coupling.py
 src/paramnet.py                       LSTM + MLP: attributes/climatology -> 27 bounded parameters
 src/train.py, src/infer.py            Hydra-driven training / checkpoint scoring CLIs
 configs/                              Hydra config groups (data/split/model/train)

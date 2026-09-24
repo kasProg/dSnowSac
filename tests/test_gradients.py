@@ -153,30 +153,29 @@ def test_vjp_matches_manual_perturbation(tess, param):
        finite-difference sum(raim)+sum(sneqv) directly.
 
     These use the same finite-difference formula on both sides by
-    construction -- this test is not validating that FD is an accurate
-    gradient estimator (it structurally can't be, at hard PXTEMP/ADC
-    thresholds -- see notes/NOTES.md and the flat-gradient test below).
-    It validates that vector_jacobian_product's *wiring* -- which
-    parameter got perturbed, which outputs got read, the cotangent dot
-    product, accumulation across outputs -- is correct. A bug in any of
-    those (wrong param mutated, sign flipped, output name typo'd,
-    cotangent applied to the wrong output) would show up as a mismatch
-    here even though the underlying FD math is identical.
+    construction (central difference at the same eps, matching what the
+    endpoint's finite_difference_vjp helper does) -- this test is not
+    validating that FD is an accurate gradient estimator (it structurally
+    can't be, at hard PXTEMP/ADC thresholds -- see notes/NOTES.md and the
+    flat-gradient test below). It validates that vector_jacobian_product's
+    *wiring* -- which parameter got perturbed, which outputs got read, the
+    cotangent dot product, accumulation across outputs -- is correct. A
+    bug in any of those (wrong param mutated, sign flipped, output name
+    typo'd, cotangent applied to the wrong output) would show up as a
+    mismatch here even though the underlying FD math is identical.
     """
     import tesseract_api as api
 
     inputs = _synthetic_inputs()
-    base = tess.apply(inputs)
-    n = len(base["raim"])
-
+    n = len(tess.apply(inputs)["raim"])
     cotangent = {"raim": np.ones(n, dtype=np.float32), "sneqv": np.ones(n, dtype=np.float32)}
     vjp = tess.vector_jacobian_product(
         inputs, vjp_inputs=[param], vjp_outputs=["raim", "sneqv"], cotangent_vector=cotangent
     )
 
-    # Use the same float32-coerced base value vector_jacobian_product itself
-    # reads (via the validated InputSchema), not the raw Python float from
-    # the input dict -- pydantic coerces e.g. 1.05 -> np.float32(1.05) ==
+    # Use the same float32-coerced base value the endpoint itself reads
+    # (via the validated InputSchema), not the raw Python float from the
+    # input dict -- pydantic coerces e.g. 1.05 -> np.float32(1.05) ==
     # 1.0499999523..., and computing eps from a slightly different base
     # value than the one actually perturbed produces a spurious mismatch
     # for threshold/lookup-heavy melt physics that has nothing to do with
@@ -184,29 +183,19 @@ def test_vjp_matches_manual_perturbation(tess, param):
     validated = api.InputSchema(**inputs)
     base_value = float(getattr(validated, param))
     eps = _fd_step(base_value)
-    perturbed_inputs = dict(inputs)
-    perturbed_inputs[param] = base_value + eps
-    perturbed = tess.apply(perturbed_inputs)
 
-    # Cast to float64 and subtract element-wise BEFORE summing, matching
-    # what vector_jacobian_product itself does (tesseract_api.py). Summing
-    # the float32 arrays first and subtracting the two sums (as an earlier
-    # version of this test did) hits catastrophic cancellation: perturbed
-    # and base are nearly-identical float32 arrays, so their sums are two
-    # close, largeish float32 numbers, and subtracting them loses far more
-    # precision than subtracting the (small) per-element differences and
-    # summing those in float64. That earlier version disagreed with the
-    # correct vjp by ~0.3-0.5% for several parameters -- confirmed by
-    # reproducing vector_jacobian_product's internal arithmetic line by
-    # line, which matched vjp bit-for-bit and made clear the mismatch was
-    # this test's bug, not the wrapper's.
-    raim_diff = (
-        np.asarray(perturbed["raim"], dtype=np.float64) - np.asarray(base["raim"], dtype=np.float64)
-    ).sum()
-    sneqv_diff = (
-        np.asarray(perturbed["sneqv"], dtype=np.float64) - np.asarray(base["sneqv"], dtype=np.float64)
-    ).sum()
-    manual_grad = (raim_diff + sneqv_diff) / eps
+    # Independent CENTRAL difference through apply() -- the same algorithm
+    # the endpoint's finite_difference_vjp uses. Cast to float64 and
+    # subtract element-wise BEFORE summing (catastrophic-cancellation
+    # avoidance: perturbed and base are nearly-identical float32 arrays).
+    def _summed(update):
+        out = tess.apply({**inputs, param: update})
+        return (
+            np.asarray(out["raim"], dtype=np.float64).sum()
+            + np.asarray(out["sneqv"], dtype=np.float64).sum()
+        )
+
+    manual_grad = (_summed(base_value + eps) - _summed(base_value - eps)) / (2 * eps)
 
     np.testing.assert_allclose(float(vjp[param]), manual_grad, rtol=1e-4, atol=1e-6)
 
@@ -240,6 +229,60 @@ def test_vjp_linear_in_cotangent(tess):
         np.testing.assert_allclose(
             float(vjp_raim[p]) + float(vjp_sneqv[p]), float(vjp_both[p]), rtol=1e-5, atol=1e-8
         )
+
+
+@pytest.mark.parametrize("param", DIFFERENTIABLE_PARAMS)
+def test_jvp_matches_vjp_by_duality(tess, param):
+    """Forward-mode (JVP) and reverse-mode (VJP) must agree through the
+    defining adjoint identity: for a unit tangent e_p on one parameter and
+    an arbitrary output cotangent u,
+
+        <u, J @ e_p>  ==  <J^T @ u, e_p>  ==  (J^T @ u)[p]
+
+    i.e. dotting the JVP output tangent against u gives exactly the VJP's
+    gradient for that parameter. Both endpoints finite-difference the same
+    columns, so this is a tight (rtol 1e-5) internal-consistency check --
+    it catches a JVP that accumulates the wrong column, drops an output,
+    or scales the tangent wrong, none of which the VJP tests would see.
+    """
+    inputs = _synthetic_inputs()
+    n = len(tess.apply(inputs)["raim"])
+    rng = np.random.default_rng(42)
+    u = {"raim": rng.normal(size=n).astype(np.float32),
+         "sneqv": rng.normal(size=n).astype(np.float32)}
+
+    jvp = tess.jacobian_vector_product(
+        inputs, jvp_inputs=[param], jvp_outputs=["raim", "sneqv"],
+        tangent_vector={param: np.float32(1.0)},
+    )
+    forward = sum(
+        float(np.dot(u[o].astype(np.float64), np.asarray(jvp[o], dtype=np.float64)))
+        for o in ("raim", "sneqv")
+    )
+
+    vjp = tess.vector_jacobian_product(
+        inputs, vjp_inputs=[param], vjp_outputs=["raim", "sneqv"], cotangent_vector=u,
+    )
+    np.testing.assert_allclose(forward, float(vjp[param]), rtol=1e-5, atol=1e-8)
+
+
+def test_jvp_linear_in_tangent(tess):
+    """A JVP is linear in the input tangent: seeding tangents on two
+    parameters at once equals the sum of the two single-parameter JVPs.
+    Validates the tangent-accumulation loop with no external reference."""
+    inputs = _synthetic_inputs()
+    p, q = "mfmax", "mfmin"
+    out = lambda tv: tess.jacobian_vector_product(  # noqa: E731
+        inputs, jvp_inputs=set(tv), jvp_outputs=["raim"], tangent_vector=tv,
+    )["raim"]
+    only_p = out({p: np.float32(1.0)})
+    only_q = out({q: np.float32(1.0)})
+    both = out({p: np.float32(1.0), q: np.float32(1.0)})
+    np.testing.assert_allclose(
+        np.asarray(both, dtype=np.float64),
+        np.asarray(only_p, dtype=np.float64) + np.asarray(only_q, dtype=np.float64),
+        rtol=1e-5, atol=1e-8,
+    )
 
 
 def test_vjp_rejects_adc():
@@ -407,13 +450,14 @@ def test_sacsma_abstract_eval_matches_apply_shapes(tess_sacsma):
 @pytest.mark.parametrize("param", SACSMA_DIFFERENTIABLE_PARAMS)
 def test_sacsma_vjp_matches_manual_perturbation(tess_sacsma, param):
     """Same structure as test_vjp_matches_manual_perturbation above, for
-    SAC-SMA's q/eta outputs. See that test's docstring for what this
-    does and doesn't prove (wiring correctness, not FD accuracy)."""
+    SAC-SMA's q/eta outputs -- an independent central difference through
+    apply(), matching the endpoint's finite_difference_vjp algorithm. See
+    that test's docstring for what this does and doesn't prove (wiring
+    correctness, not FD accuracy)."""
     import tesseract_api as api
 
     inputs = _sacsma_synthetic_inputs()
-    base = tess_sacsma.apply(inputs)
-    n = len(base["q"])
+    n = len(tess_sacsma.apply(inputs)["q"])
 
     cotangent = {"q": np.ones(n), "eta": np.ones(n)}
     vjp = tess_sacsma.vector_jacobian_product(
@@ -423,13 +467,12 @@ def test_sacsma_vjp_matches_manual_perturbation(tess_sacsma, param):
     validated = api.InputSchema(**inputs)
     base_value = float(getattr(validated, param))
     eps = _fd_step(base_value)
-    perturbed_inputs = dict(inputs)
-    perturbed_inputs[param] = base_value + eps
-    perturbed = tess_sacsma.apply(perturbed_inputs)
 
-    q_diff = (np.asarray(perturbed["q"]) - np.asarray(base["q"])).sum()
-    eta_diff = (np.asarray(perturbed["eta"]) - np.asarray(base["eta"])).sum()
-    manual_grad = (q_diff + eta_diff) / eps
+    def _summed(update):
+        out = tess_sacsma.apply({**inputs, param: update})
+        return np.asarray(out["q"]).sum() + np.asarray(out["eta"]).sum()
+
+    manual_grad = (_summed(base_value + eps) - _summed(base_value - eps)) / (2 * eps)
 
     np.testing.assert_allclose(float(vjp[param]), manual_grad, rtol=1e-4, atol=1e-8)
 
@@ -504,3 +547,82 @@ def test_sacsma_backward_through_apply_tesseract(tess_sacsma, param):
         f"d(loss)/d({param}) came back exactly 0.0 through autograd for SAC-SMA -- "
         "same load-bearing-gradients concern as the snow17 version of this test."
     )
+
+
+@pytest.mark.parametrize("param", ("uztwm", "uzk", "lztwm"))
+def test_sacsma_jvp_matches_vjp_by_duality(tess_sacsma, param):
+    """Same adjoint-identity check as test_jvp_matches_vjp_by_duality, for
+    SAC-SMA's scalar parameters: <u, J @ e_p> == (J^T @ u)[p]."""
+    inputs = _sacsma_synthetic_inputs()
+    n = len(tess_sacsma.apply(inputs)["q"])
+    rng = np.random.default_rng(7)
+    u = {"q": rng.normal(size=n), "eta": rng.normal(size=n)}
+
+    jvp = tess_sacsma.jacobian_vector_product(
+        inputs, jvp_inputs=[param], jvp_outputs=["q", "eta"], tangent_vector={param: 1.0},
+    )
+    forward = sum(float(np.dot(u[o], np.asarray(jvp[o]))) for o in ("q", "eta"))
+    vjp = tess_sacsma.vector_jacobian_product(
+        inputs, vjp_inputs=[param], vjp_outputs=["q", "eta"], cotangent_vector=u,
+    )
+    np.testing.assert_allclose(forward, float(vjp[param]), rtol=1e-5, atol=1e-10)
+
+
+def test_sacsma_pcp_jvp_is_a_directional_derivative(tess_sacsma):
+    """The load-bearing endpoint for the coupled pipeline: SAC-SMA's JVP
+    w.r.t. its pcp forcing (RAIM in the chain) must return the directional
+    derivative of q along the given tangent -- d/da q(pcp + a*tangent)|a=0
+    -- validated against an INDEPENDENT central finite difference of
+    apply() along the same direction. This is what carries Snow17's RAIM
+    tangent through SAC-SMA without ever building the dense d(q)/d(pcp)
+    Jacobian, so it has to be right and it has to be checked against
+    something other than its own machinery.
+    """
+    inputs = _sacsma_synthetic_inputs()
+    n = len(tess_sacsma.apply(inputs)["q"])
+    rng = np.random.default_rng(3)
+    direction = rng.normal(size=n)
+
+    jvp = tess_sacsma.jacobian_vector_product(
+        inputs, jvp_inputs=["pcp"], jvp_outputs=["q"], tangent_vector={"pcp": direction},
+    )["q"]
+
+    # Independent central FD of apply() along `direction`, at a small
+    # well-converged step (verified stable in the endpoint's own analysis).
+    pcp = np.asarray(inputs["pcp"], dtype=np.float64)
+    eps = 1e-5 * (float(np.linalg.norm(pcp)) / float(np.linalg.norm(direction)))
+    plus = tess_sacsma.apply({**inputs, "pcp": pcp + eps * direction})["q"]
+    minus = tess_sacsma.apply({**inputs, "pcp": pcp - eps * direction})["q"]
+    fd = (np.asarray(plus) - np.asarray(minus)) / (2 * eps)
+
+    np.testing.assert_allclose(np.asarray(jvp), fd, rtol=1e-3, atol=1e-6)
+
+
+def test_sacsma_forward_mode_chains_through_pcp(tess_sacsma):
+    """End-to-end forward-mode proof that a tangent on SAC-SMA's pcp input
+    flows to its q output via torch dual tensors and apply_tesseract --
+    the exact mechanism that carries Snow17's RAIM tangent into SAC-SMA in
+    the coupled pipeline. Without pcp being differentiable in the schema
+    and handled by the JVP endpoint, this tangent would be dropped
+    silently and the coupled Snow17 gradient would be wrong."""
+    torch = pytest.importorskip("torch")
+    import torch.autograd.forward_ad as fwAD
+    from tesseract_torch import apply_tesseract
+
+    inputs = _sacsma_synthetic_inputs()
+    n = len(tess_sacsma.apply(inputs)["q"])
+    rng = np.random.default_rng(5)
+    direction = rng.normal(size=n)
+
+    pcp = torch.tensor(np.asarray(inputs["pcp"], dtype=np.float64))
+    tangent = torch.tensor(direction)
+    with fwAD.dual_level():
+        pcp_dual = fwAD.make_dual(pcp, tangent)
+        out = apply_tesseract(tess_sacsma, {**inputs, "pcp": pcp_dual})
+        _, q_tangent = fwAD.unpack_dual(out["q"])
+
+    assert q_tangent is not None, "pcp tangent was dropped -- forward-mode chaining broken"
+    direct = tess_sacsma.jacobian_vector_product(
+        inputs, jvp_inputs=["pcp"], jvp_outputs=["q"], tangent_vector={"pcp": direction},
+    )["q"]
+    np.testing.assert_allclose(q_tangent.numpy(), np.asarray(direct), rtol=1e-6, atol=1e-9)

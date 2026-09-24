@@ -3,11 +3,13 @@
 """Tesseract API module for SAC-SMA.
 
 Wraps fortran/sacsma_shim.f90 (via src/sacsma.py's ctypes binding) as a
-Tesseract: a full-rollout apply() plus a finite-difference
-vector_jacobian_product(). Mirrors tesseracts/snow17/tesseract_api.py's
-design and structure closely -- see that file's docstring for the shared
-rationale (why full-rollout granularity, why FD is explicitly permitted
-by the hackathon rules) -- adapted for SAC-SMA's specifics below.
+Tesseract: a full-rollout apply() plus both finite-difference derivative
+endpoints -- jacobian_vector_product() (forward mode) and
+vector_jacobian_product() (reverse mode). Mirrors
+tesseracts/snow17/tesseract_api.py's design and structure closely -- see
+that file's docstring for the shared rationale (why full-rollout
+granularity, why FD is explicitly permitted by the hackathon rules) --
+adapted for SAC-SMA's specifics below.
 
 Differentiable inputs: all 16 named scalar SAC-SMA parameters (UZTWM,
 UZFWM, UZK, PCTIM, ADIMP, RIVA, ZPERC, REXP, LZTWM, LZFSM, LZFPM, LZSK,
@@ -19,21 +21,15 @@ the source -- see notes/NOTES.md), not Snow17's default 4-byte REAL. This
 schema uses Float64 throughout; do not copy Snow17's Float32 convention
 here.
 
-VJP method: forward-difference finite differences (relative step with a
-floor), same convention as tesseracts/snow17/tesseract_api.py. This is a
-DIFFERENT, independent mechanism from src/coupling.py's internal FD sweep
--- this file's vector_jacobian_product exists so the SAC-SMA Tesseract is
-independently testable/reusable on its own (matching the "a standalone
-Tesseract works with any downstream model" reusability argument for
-having two Tesseracts in the first place), and is what a caller doing
-plain single-Tesseract composition (e.g. training SAC-SMA parameters
-alone against observed RAIM, or any future reuse outside this pipeline)
-would go through. The actual Snow17->SAC-SMA coupled training path in
-this project does NOT call this endpoint -- src/coupling.py calls apply()
-directly (see that module's docstring for why: an honest VJP through
-SAC-SMA's own d(runoff)/d(RAIM) would need one perturbed run per RAIM
-timestep, thousands of runs, which this endpoint would produce correctly
-but far too slowly for that use).
+In the coupled pipeline this Tesseract is the DOWNSTREAM stage: Snow17's
+JVP produces a tangent on RAIM, which SAC-SMA consumes as the tangent on
+its `pcp` input. Because `pcp` is a per-timestep forcing array (not one
+of the 16 scalar parameters), its forward-mode sensitivity is carried by
+tesseract-torch as a single tangent vector along the chain -- SAC-SMA
+never has to materialize the dense d(q)/d(RAIM) Jacobian that a naive
+reverse-mode composition would demand. See src/coupling.py for the full
+argument. This endpoint also stands alone for any single-Tesseract reuse
+(training SAC-SMA parameters directly against observed RAIM).
 """
 
 import os
@@ -44,6 +40,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from tesseract_core.runtime import Array, Differentiable, Float64, ShapeDType
+from tesseract_core.runtime.experimental import finite_difference_jvp, finite_difference_vjp
 
 # Local dev: tesseract_api.py -> tesseracts/sacsma -> tesseracts -> repo root
 # (3 parents up). Inside a built container this doesn't hold -- see the
@@ -69,12 +66,15 @@ class InputSchema(BaseModel):
     # convention (it divides internally by 86400 to get days).
     dtm: Float64
 
-    # Forcing, mm/day, deg C, mm/day. Not differentiated: same reasoning
-    # as Snow17's pcp/tmp -- the LSTM predicts SAC-SMA *parameters*, not
-    # forcing perturbations. tmp currently has zero effect on output
-    # (only read behind the disabled IFRZE frozen-ground flag -- see
-    # notes/logs.md) but is kept for interface parity with EXSAC.
-    pcp: Array[(None,), Float64]
+    # Forcing, mm/day, deg C, mm/day. pcp IS differentiable: in the
+    # coupled pipeline it receives RAIM from Snow17, and forward-mode
+    # composition carries the RAIM tangent through here (that tangent is
+    # the whole reason the pipeline avoids a dense d(q)/d(RAIM) Jacobian).
+    # tmp/etp are not differentiated -- the LSTM predicts SAC-SMA
+    # *parameters*, not forcing perturbations, and tmp currently has zero
+    # effect on output anyway (only read behind the disabled IFRZE
+    # frozen-ground flag -- see notes/logs.md).
+    pcp: Differentiable[Array[(None,), Float64]]
     tmp: Array[(None,), Float64]
     etp: Array[(None,), Float64]
 
@@ -117,8 +117,9 @@ class OutputSchema(BaseModel):
 
 
 #
-# Shared rollout call -- used by apply() and, repeatedly, by
-# vector_jacobian_product() for the base + perturbed evaluations.
+# Shared rollout call -- wrapped by apply(), which the finite-difference
+# derivative endpoints call repeatedly for their base + perturbed
+# evaluations.
 #
 
 
@@ -175,19 +176,78 @@ def apply(inputs: InputSchema) -> OutputSchema:
 # Optional endpoints
 #
 
-# Forward-difference step size: relative to the parameter's own
-# magnitude, with a floor so a near-zero parameter (e.g. PCTIM/ADIMP,
-# often 0 in practice) doesn't collapse the step to zero. Same convention
-# as tesseracts/snow17/tesseract_api.py's _fd_step -- see that file's
-# comment for the reasoning; SAC-SMA's float64 precision could tolerate a
-# smaller floor, but there's no benefit to diverging from the sibling
-# wrapper's already-validated values without a concrete reason to.
+# All differentiable inputs: the 16 scalar parameters plus the pcp
+# forcing (RAIM in the coupled pipeline). pcp is differentiable as a whole
+# vector, not element by element -- see the endpoints below for how each
+# mode handles it.
+DIFFERENTIABLE_INPUTS = (*DIFFERENTIABLE_PARAMS, "pcp")
+
+# Both derivative endpoints delegate to tesseract-core's experimental
+# finite-difference helpers (see the sibling snow17 wrapper's comment for
+# the shared rationale). We supply per-input absolute step sizes: for the
+# scalar parameters, relative-with-floor (SAC-SMA spans UZTWM ~O(100) mm
+# next to LZPK ~O(0.01), so one absolute step can't serve both). For the
+# pcp forcing, the JVP is a DIRECTIONAL derivative along the incoming
+# tangent, and finite_difference_jvp handles that natively -- one central
+# pair, O(1) rollouts regardless of series length -- provided we hand it a
+# step sized to the perturbation the tangent actually produces (below).
 _FD_REL_STEP = 1e-3
 _FD_MIN_STEP = 1e-4
+
+# Step for the pcp directional perturbation. Deliberately small AND
+# central (the helper default): SAC-SMA's storage-full / percolation
+# conditionals are piecewise-linear kinks in pcp, and a large one-sided
+# step secants ACROSS a kink at any timestep whose perturbation crosses
+# it, giving a slope that is neither the left nor the right derivative and
+# drifts with step size. A small central difference converges to the
+# honest local slope (verified stable to ~1e-8 across eps from 1e-3 down
+# to 1e-6). Same class of hard-threshold issue documented for Snow17's
+# PXTEMP; the scalar parameters mostly act smoothly, but the wide pcp
+# coupling is where it bites.
+_PCP_FD_REL_STEP = 1e-4
 
 
 def _fd_step(value: float) -> float:
     return max(abs(value) * _FD_REL_STEP, _FD_MIN_STEP)
+
+
+def _pcp_eps(inputs: InputSchema, tangent: np.typing.ArrayLike) -> float:
+    """Absolute step so that finite_difference_jvp's `pcp + eps*tangent`
+    perturbation has magnitude ~ _PCP_FD_REL_STEP * ||pcp|| -- i.e. the
+    directional step is sized to the pcp series, not the (arbitrary-norm)
+    incoming tangent."""
+    pcp_norm = float(np.linalg.norm(np.asarray(inputs.pcp, dtype=np.float64))) or 1.0
+    tangent_norm = float(np.linalg.norm(np.asarray(tangent, dtype=np.float64))) or 1.0
+    return _PCP_FD_REL_STEP * pcp_norm / tangent_norm
+
+
+def jacobian_vector_product(
+    inputs: InputSchema,
+    jvp_inputs: set[str],
+    jvp_outputs: set[str],
+    tangent_vector: dict[str, np.typing.ArrayLike],
+) -> dict[str, np.typing.ArrayLike]:
+    """Forward-mode: push input tangents (scalar params and/or the pcp
+    series) to output tangents, via tesseract-core's finite_difference_jvp.
+    This is the endpoint the coupled forward-mode pipeline drives -- it
+    arrives with a pcp tangent (Snow17's RAIM tangent) and, when parameters
+    are also being learned, tangents on the 16 scalars."""
+    unsupported = set(jvp_inputs) - set(DIFFERENTIABLE_INPUTS)
+    if unsupported:
+        raise ValueError(
+            f"jacobian_vector_product only supports {DIFFERENTIABLE_INPUTS}, "
+            f"got unsupported input(s): {sorted(unsupported)}"
+        )
+    eps: dict[str, float] = {
+        name: _fd_step(float(getattr(inputs, name)))
+        for name in jvp_inputs
+        if name != "pcp"
+    }
+    if "pcp" in jvp_inputs:
+        eps["pcp"] = _pcp_eps(inputs, tangent_vector["pcp"])
+    return finite_difference_jvp(
+        apply, inputs, jvp_inputs, jvp_outputs, tangent_vector, algorithm="central", eps=eps
+    )
 
 
 def vector_jacobian_product(
@@ -196,33 +256,24 @@ def vector_jacobian_product(
     vjp_outputs: set[str],
     cotangent_vector: dict[str, np.typing.ArrayLike],
 ) -> dict[str, np.typing.ArrayLike]:
+    """Reverse-mode: pull output cotangents back to input gradients, via
+    tesseract-core's finite_difference_vjp. Only the scalar parameters are
+    supported here -- a reverse-mode gradient w.r.t. the full pcp series is
+    exactly the dense-Jacobian object the coupled pipeline is designed to
+    avoid (it would cost one rollout per pcp timestep). Callers needing pcp
+    sensitivity use forward mode (jacobian_vector_product) instead."""
     unsupported = set(vjp_inputs) - set(DIFFERENTIABLE_PARAMS)
     if unsupported:
         raise ValueError(
-            f"vector_jacobian_product only supports {DIFFERENTIABLE_PARAMS}, "
+            f"vector_jacobian_product supports only the scalar parameters "
+            f"{DIFFERENTIABLE_PARAMS} (not pcp -- use forward mode for that); "
             f"got unsupported input(s): {sorted(unsupported)}"
         )
-
-    base = _rollout(inputs)
-
-    vjp: dict[str, np.typing.ArrayLike] = {}
-    for name in vjp_inputs:
-        base_value = float(getattr(inputs, name))
-        eps = _fd_step(base_value)
-        perturbed_inputs = inputs.model_copy(update={name: base_value + eps})
-        perturbed = _rollout(perturbed_inputs)
-
-        grad = 0.0
-        for out_name in vjp_outputs:
-            d_output = (
-                np.asarray(perturbed[out_name], dtype=np.float64)
-                - np.asarray(base[out_name], dtype=np.float64)
-            ) / eps
-            cotangent = np.asarray(cotangent_vector[out_name], dtype=np.float64)
-            grad += float(np.dot(cotangent.ravel(), d_output.ravel()))
-        vjp[name] = np.float64(grad)
-
-    return vjp
+    eps = {name: _fd_step(float(getattr(inputs, name))) for name in vjp_inputs}
+    out = finite_difference_vjp(
+        apply, inputs, vjp_inputs, vjp_outputs, cotangent_vector, algorithm="central", eps=eps
+    )
+    return {name: np.float64(float(np.asarray(out[name]))) for name in vjp_inputs}
 
 
 def abstract_eval(abstract_inputs) -> dict:

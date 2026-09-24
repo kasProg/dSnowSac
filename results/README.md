@@ -20,13 +20,25 @@ results/runs/<name>/
 
 ## `runs/model_9yrs_spatial/` -- primary result
 
+> **⚠️ Stale w.r.t. current code — retrain pending.** This run was trained
+> under the previous *reverse-mode* cross-container coupling. The gradient
+> path has since been rewritten to *forward-mode* Tesseract composition
+> (see `src/coupling.py` and notes/logs.md, 2026-09-22). The two are
+> gradient-equivalent up to finite-difference noise — the test suite checks
+> the coupled gradient against an independent brute-force FD through both
+> real Fortran models — and the forward pass is unchanged, so the committed
+> `checkpoint.pt` still reloads and scores as recorded via `src/infer.py`.
+> But re-running training now follows a different optimization trajectory
+> and will not reproduce the exact numbers below. A fresh run under the new
+> code has not yet been committed; the table and `test_predictions.json`
+> reflect the prior run. Treat the numbers as indicative, not as the
+> current code's reproducible output, until this run is regenerated.
+
 Snow17 + SAC-SMA + `ParamNet` (LSTM climatology encoder + static
 attributes -> 27 bounded physical parameters), trained end-to-end
 through both Tesseracts via `src/coupling.py`. 35 train / 10 heldout
 basins (`split=spatial`), WY1991-1999 (9-year) window, 150 epochs,
-~5.1s/epoch (~45 real Fortran/Tesseract calls per basin per epoch via
-finite-difference gradients), ~13 minutes total. This is `configs/`'s
-current default; regenerate with:
+~13 minutes total. This is `configs/`'s current default; regenerate with:
 
 ```bash
 .venv/bin/python src/train.py output_dir=results/runs/model_9yrs_spatial

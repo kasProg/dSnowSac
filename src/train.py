@@ -14,11 +14,12 @@ config, no Hydra compose/multirun machinery needed for that path.
 
 One gradient step per epoch, not per basin: theta_A/theta_B are computed
 for all training basins in a single batched ParamNet forward pass, then
-each basin's own (expensive, Fortran-backed) CoupledTwoStageFunction
-call runs individually -- that part isn't batchable, SAC-SMA/Snow17 are
-single-HRU by construction -- and their losses are averaged into ONE
-scalar before a single .backward()/optimizer.step() call. Standard
-full-batch gradient descent over basins, not per-basin SGD.
+each basin's own (expensive, Fortran-backed) coupled Snow17 -> SAC-SMA
+run happens individually via CoupledNWSStack.run -- that part isn't
+batchable, SAC-SMA/Snow17 are single-HRU by construction -- and their
+losses are averaged into ONE scalar before a single
+.backward()/optimizer.step() call. Standard full-batch gradient descent
+over basins, not per-basin SGD.
 
 A pure data-driven LSTM baseline (src/benchmark_lstm.py) used to live
 alongside this as a second `model=` option, quantifying what the

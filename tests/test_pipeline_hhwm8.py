@@ -1,6 +1,6 @@
 """Single-basin, direct-parameter-optimization proof: Snow17 -> SAC-SMA ->
 NSE-style loss -> backward(), chained via src/pipeline.py's
-CoupledNWSStack (built on src/coupling.py's CoupledTwoStageFunction).
+CoupledNWSStack (built on src/coupling.py's forward-mode bridge).
 The actual milestone check: loss goes down.
 
 No real observed streamflow ships with either vendored ex1 test case --
@@ -150,40 +150,69 @@ def test_loss_decreases_with_synthetic_target_recovery(hhwm8_setup):
     )
 
 
-def test_sacsma_vjp_matches_fd_fallback(hhwm8_setup):
-    """theta_B's gradient now routes through SAC-SMA's own Tesseract
-    vector_jacobian_product() endpoint by default (CoupledNWSStack's
-    use_sacsma_vjp=True) instead of coupling.py's hand-rolled central-FD
-    sweep (use_sacsma_vjp=False, the previous behavior, still available
-    as a fallback). This is exactly the "two different gradient-
-    computation machineries feeding the same upstream network" situation
-    coupling.py's module docstring flags as a double-counting/sign-error
-    risk -- so check the two paths actually agree on real HHWM8 data,
-    not just trust the wiring by inspection.
+def test_coupled_gradient_matches_independent_brute_force_fd(hhwm8_setup):
+    """The load-bearing correctness check: the forward-mode gradient that
+    flows through both real Fortran models via CoupledNWSStack must agree
+    with an INDEPENDENT brute-force finite difference of the same loss --
+    computed by running the whole Snow17 -> SAC-SMA chain end to end at
+    perturbed parameters, with no reference to the Tesseracts' own
+    derivative endpoints. Two independent computations agreeing is what
+    rules out a silent wiring bug (wrong sign, wrong parameter order,
+    wrong output name, RAIM tangent dropped between containers) that
+    comparing FD to itself never could.
 
-    theta_A's path is untouched by use_sacsma_vjp either way (only
-    theta_B's block branches on it), so its gradient should match
-    bitwise across both stacks -- checked as a control, not the point of
-    this test."""
-    _, snow17_forcing, sacsma_forcing, theta_A_true, theta_B_true = hhwm8_setup
+    Checked on a handful of parameters per model (not all 27 -- each
+    brute-force column is two full chained rollouts, and the point is
+    corroboration across both stages and both dtypes, not exhaustive
+    coverage). loss = sum(runoff), so the incoming cotangent is all-ones
+    and the analytic gradient is J^T @ 1 = column sums of the parameter
+    Jacobian.
+    """
+    stack, snow17_forcing, sacsma_forcing, theta_A_true, theta_B_true = hhwm8_setup
 
-    stack_vjp = CoupledNWSStack()  # use_sacsma_vjp=True, the new default
-    stack_fd = CoupledNWSStack(use_sacsma_vjp=False)  # old hand-rolled sweep
+    theta_A = torch.tensor(theta_A_true, dtype=torch.float32, requires_grad=True)
+    theta_B = torch.tensor(theta_B_true, dtype=torch.float64, requires_grad=True)
+    sim = stack.run(theta_A, theta_B, snow17_forcing, sacsma_forcing)
+    sim.sum().backward()  # all-ones cotangent
+    grad_A_fwd = theta_A.grad.numpy().copy()
+    grad_B_fwd = theta_B.grad.numpy().copy()
 
-    def _grads(stack):
-        theta_A = torch.tensor(theta_A_true, dtype=torch.float32, requires_grad=True)
-        theta_B = torch.tensor(theta_B_true, dtype=torch.float64, requires_grad=True)
-        sim = stack.run(theta_A, theta_B, snow17_forcing, sacsma_forcing)
-        sim.sum().backward()  # simplest cotangent: all-ones
-        return theta_A.grad.clone(), theta_B.grad.clone()
+    def loss_at(theta_a, theta_b):
+        with torch.no_grad():
+            out = stack.run(
+                torch.tensor(theta_a, dtype=torch.float32),
+                torch.tensor(theta_b, dtype=torch.float64),
+                snow17_forcing, sacsma_forcing,
+            )
+        return float(out.sum())
 
-    grad_A_vjp, grad_B_vjp = _grads(stack_vjp)
-    grad_A_fd, grad_B_fd = _grads(stack_fd)
+    def brute(theta, other, i, theta_is_a):
+        eps = max(abs(theta[i]) * 5e-3, 1e-4)  # unrelated to the endpoints' own steps
+        plus = theta.copy(); plus[i] += eps
+        minus = theta.copy(); minus[i] -= eps
+        if theta_is_a:
+            return (loss_at(plus, other) - loss_at(minus, other)) / (2 * eps)
+        return (loss_at(other, plus) - loss_at(other, minus)) / (2 * eps)
 
-    torch.testing.assert_close(grad_A_vjp, grad_A_fd, rtol=0, atol=0)  # unaffected path -- exact
-
-    # theta_B: SAC-SMA's own VJP is forward-difference; the fallback sweep
-    # is central-difference. Different formulas at the same eps -- expect
-    # first-order agreement, not bitwise, but a sign flip, wrong param
-    # order, or wrong output name would blow well past this.
-    torch.testing.assert_close(grad_B_vjp, grad_B_fd, rtol=0.05, atol=1e-2)
+    # Tolerance: 5% relative. This is a finite-difference-vs-finite-
+    # difference comparison, and Snow17 runs in float32 (~7 significant
+    # digits), so neither side is an exact derivative -- a brute-force
+    # central difference on the theta_A parameters visibly scatters at the
+    # several-percent level as its own step size changes, and the
+    # endpoints' internal steps differ from this check's. 5% catches every
+    # bug this test exists to catch (a sign flip, a wrong parameter, a
+    # dropped RAIM tangent between containers all miss by >100%) while not
+    # flagging honest float32 FD noise. The SAC-SMA parameters (float64)
+    # agree far tighter; the loose bound is set by the Snow17 side.
+    for i in (0, 1, 2):  # SCF, MFMAX, MFMIN
+        ref = brute(theta_A_true, theta_B_true, i, theta_is_a=True)
+        assert abs(grad_A_fwd[i] - ref) <= 0.05 * abs(ref) + 1e-3, (
+            f"theta_A[{i}] ({SNOW17_PARAMS[i]}): forward-mode {grad_A_fwd[i]:.6g} "
+            f"vs brute-force FD {ref:.6g}"
+        )
+    for j in (0, 2, 8):  # UZTWM, UZK, LZTWM
+        ref = brute(theta_B_true, theta_A_true, j, theta_is_a=False)
+        assert abs(grad_B_fwd[j] - ref) <= 0.05 * abs(ref) + 1e-3, (
+            f"theta_B[{j}] ({SACSMA_PARAMS[j]}): forward-mode {grad_B_fwd[j]:.6g} "
+            f"vs brute-force FD {ref:.6g}"
+        )

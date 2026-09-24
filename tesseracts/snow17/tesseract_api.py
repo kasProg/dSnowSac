@@ -3,22 +3,33 @@
 """Tesseract API module for Snow-17.
 
 Wraps fortran/snow17_shim.f90 (via src/snow17.py's ctypes binding) as a
-Tesseract: a full-rollout apply() plus a finite-difference
-vector_jacobian_product(), so PyTorch's autograd can cross the Fortran
-boundary via tesseract-torch's apply_tesseract().
+Tesseract: a full-rollout apply() plus both finite-difference derivative
+endpoints -- jacobian_vector_product() (forward mode) and
+vector_jacobian_product() (reverse mode) -- so PyTorch's autograd can
+cross the Fortran boundary in either direction via tesseract-torch's
+apply_tesseract().
 
 Differentiable inputs: the 11 named scalar snow17 parameters (SCF, MFMAX,
 MFMIN, UADJ, SI, NMF, TIPM, MBASE, PXTEMP, PLWHC, DAYGM). The 11-point ADC
 (areal depletion curve) is intentionally NOT differentiable in this
 version -- see notes/logs.md for why.
 
-VJP method: forward-difference finite differences, one perturbed rollout
-per differentiable input requested plus one shared base rollout. Wrapped
-at full-rollout granularity (this whole module runs one call to
-EXSNOW19 per timestep, not per Tesseract call), per Tesseract's own
-guidance that it targets kernels running at least several seconds --
+Both derivative endpoints delegate to tesseract-core's experimental
+finite-difference helpers (finite_difference_jvp / finite_difference_vjp)
+over this module's apply(); we supply per-parameter step sizes (see
+_fd_eps). Wrapped at full-rollout granularity (this whole module runs one
+call to EXSNOW19 per timestep, not per Tesseract call), per Tesseract's
+own guidance that it targets kernels running at least several seconds --
 finite-differencing per-timestep would be both wrong (state carries
 across timesteps within a rollout) and far too fine-grained.
+
+The coupled Snow17 -> SAC-SMA training pipeline (src/pipeline.py) drives
+composition in FORWARD mode: it seeds a tangent on each snow17 parameter
+and lets tesseract-torch chain this JVP endpoint into SAC-SMA's, carrying
+the RAIM tangent between them without ever forming the dense
+d(runoff)/d(RAIM) Jacobian. See src/coupling.py for why forward mode is
+the natural fit here (few parameters, one wide intermediate flux, a
+scalar loss).
 """
 
 import os
@@ -29,6 +40,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from tesseract_core.runtime import Array, Differentiable, Float32, Int32, ShapeDType
+from tesseract_core.runtime.experimental import finite_difference_jvp, finite_difference_vjp
 
 # Local dev: tesseract_api.py -> tesseracts/snow17 -> tesseracts -> repo root
 # (3 parents up). Inside a built container, tesseract_api.py instead lands
@@ -174,13 +186,18 @@ def apply(inputs: InputSchema) -> OutputSchema:
 # Optional endpoints
 #
 
-# Forward-difference step size: relative to the parameter's own
-# magnitude, with a floor so a near-zero parameter (e.g. MBASE=0) doesn't
-# collapse the step to something swamped by float32 rounding in the
-# Fortran call. 1e-3 relative is conservative for float32 (~7 significant
-# digits) -- small enough that a first-order forward difference is a
-# reasonable local slope estimate, large enough that the perturbed run's
-# output actually differs from the base run's at float32 precision.
+# Both derivative endpoints delegate to tesseract-core's experimental
+# finite-difference helpers (finite_difference_jvp / finite_difference_vjp).
+# The JVP helper carries a tangent through as a single directional
+# derivative (O(1) rollouts, the property the coupled pipeline relies on).
+# We supply per-parameter step sizes: the helpers take `eps` as an ABSOLUTE
+# perturbation, but Snow17's parameters span very different magnitudes (SI
+# ~1500 next to MBASE ~0), so a single absolute step is simultaneously too
+# coarse for the small ones and too fine (float32-noise-dominated) for the
+# large ones. _fd_eps applies a relative step with a floor. Central
+# differencing (the helper default) is used throughout -- it kills the
+# leading truncation term a one-sided difference carries, worth the extra
+# rollout given float32 noise.
 _FD_REL_STEP = 1e-3
 _FD_MIN_STEP = 1e-4
 
@@ -189,39 +206,48 @@ def _fd_step(value: float) -> float:
     return max(abs(value) * _FD_REL_STEP, _FD_MIN_STEP)
 
 
+def _fd_eps(inputs: InputSchema, names: set[str], endpoint: str) -> dict[str, float]:
+    """Per-path absolute step for the FD helpers, from each parameter's own
+    magnitude. Also the single place unsupported inputs are rejected --
+    ADC and forcing/state are not differentiable (see module docstring)."""
+    unsupported = set(names) - set(DIFFERENTIABLE_PARAMS)
+    if unsupported:
+        raise ValueError(
+            f"{endpoint} only supports {DIFFERENTIABLE_PARAMS}, "
+            f"got unsupported input(s): {sorted(unsupported)}"
+        )
+    return {name: _fd_step(float(getattr(inputs, name))) for name in names}
+
+
+def jacobian_vector_product(
+    inputs: InputSchema,
+    jvp_inputs: set[str],
+    jvp_outputs: set[str],
+    tangent_vector: dict[str, np.typing.ArrayLike],
+) -> dict[str, np.typing.ArrayLike]:
+    """Forward-mode: push input parameter tangents to output tangents,
+    via tesseract-core's finite_difference_jvp. This is the endpoint the
+    coupled forward-mode pipeline drives."""
+    eps = _fd_eps(inputs, jvp_inputs, "jacobian_vector_product")
+    out = finite_difference_jvp(
+        apply, inputs, jvp_inputs, jvp_outputs, tangent_vector, algorithm="central", eps=eps
+    )
+    return {name: np.asarray(out[name], dtype=np.float32) for name in jvp_outputs}
+
+
 def vector_jacobian_product(
     inputs: InputSchema,
     vjp_inputs: set[str],
     vjp_outputs: set[str],
     cotangent_vector: dict[str, np.typing.ArrayLike],
 ) -> dict[str, np.typing.ArrayLike]:
-    unsupported = set(vjp_inputs) - set(DIFFERENTIABLE_PARAMS)
-    if unsupported:
-        raise ValueError(
-            f"vector_jacobian_product only supports {DIFFERENTIABLE_PARAMS}, "
-            f"got unsupported input(s): {sorted(unsupported)}"
-        )
-
-    base = _rollout(inputs)
-
-    vjp: dict[str, np.typing.ArrayLike] = {}
-    for name in vjp_inputs:
-        base_value = float(getattr(inputs, name))
-        eps = _fd_step(base_value)
-        perturbed_inputs = inputs.model_copy(update={name: base_value + eps})
-        perturbed = _rollout(perturbed_inputs)
-
-        grad = 0.0
-        for out_name in vjp_outputs:
-            d_output = (
-                np.asarray(perturbed[out_name], dtype=np.float64)
-                - np.asarray(base[out_name], dtype=np.float64)
-            ) / eps
-            cotangent = np.asarray(cotangent_vector[out_name], dtype=np.float64)
-            grad += float(np.dot(cotangent.ravel(), d_output.ravel()))
-        vjp[name] = np.float32(grad)
-
-    return vjp
+    """Reverse-mode: pull output cotangents back to input parameter grads,
+    via tesseract-core's finite_difference_vjp."""
+    eps = _fd_eps(inputs, vjp_inputs, "vector_jacobian_product")
+    out = finite_difference_vjp(
+        apply, inputs, vjp_inputs, vjp_outputs, cotangent_vector, algorithm="central", eps=eps
+    )
+    return {name: np.float32(float(np.asarray(out[name]))) for name in vjp_inputs}
 
 
 def abstract_eval(abstract_inputs) -> dict:

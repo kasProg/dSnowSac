@@ -8,12 +8,15 @@ description: >
   apply() runs EXSAC over a daily time series for one HRU via
   fortran/sacsma_shim.f90 (built against a build-time-patched copy of
   sac1.f90 -- see patches/ and notes/NOTES.md for the upstream defect
-  this fixes); vector_jacobian_product() computes gradients w.r.t. the
-  16 learnable scalar parameters by forward-difference finite differences
-  over full rollouts. Composed with tesseracts/snow17/ via
-  src/coupling.py, not via standard automatic Tesseract composition --
-  see notes/NOTES.md's "why we bypass tesseract-torch's automatic
-  composition" writeup.
+  this fixes); jacobian_vector_product() (forward mode) and
+  vector_jacobian_product() (reverse mode) compute derivatives via
+  tesseract-core's experimental finite-difference helpers over full
+  rollouts -- w.r.t. the 16 learnable scalar parameters and, for forward
+  mode, the pcp forcing (which receives Snow-17's RAIM in the coupled
+  chain). Composed with tesseracts/snow17/
+  by forward-mode automatic Tesseract composition (tesseract-torch chains
+  the two jacobian_vector_product endpoints) -- see notes/NOTES.md's
+  "why forward-mode AD across the two Tesseracts" writeup.
 
 env:
   # See tesseracts/snow17/tesseract_config.yaml's identical setting and
