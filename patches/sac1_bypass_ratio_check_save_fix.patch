@@ -7,7 +7,7 @@
 -  LOGICAL  :: bypass_ratio_check = .FALSE. ! <-- FLAG for GOTO equivalents
 +  LOGICAL  :: bypass_ratio_check ! <-- FLAG for GOTO equivalents
 +
-+  ! dsnow17-sacsma patch: initializing a local at declaration gives it an
++  ! dSnowSac patch: initializing a local at declaration gives it an
 +  ! implicit SAVE (Fortran standard), so it silently persisted .TRUE.
 +  ! across calls. Reset explicitly every call instead. See notes/NOTES.md.
 +  bypass_ratio_check = .FALSE.

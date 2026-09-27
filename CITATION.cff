@@ -1,12 +1,12 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "δsnow17-sacsma: learning parameters of NOAA's operational Snow-17 and SAC-SMA models through unmodified Fortran"
+title: "δSnowSac: learning parameters of NOAA's operational Snow-17 and SAC-SMA models through unmodified Fortran"
 type: software
 authors:
   - given-names: Kamlesh
     family-names: Sawadekar
     orcid: "https://orcid.org/0009-0002-9011-5399"
-repository-code: "https://github.com/kasProg/dsnow17-sacsma"
+repository-code: "https://github.com/kasProg/dsnowsac"
 license: Apache-2.0
 abstract: >-
   A neural network learns the parameters of NOAA's operational Snow-17

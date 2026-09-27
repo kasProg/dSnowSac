@@ -1,4 +1,4 @@
-# δsnow17-sacsma
+# δSnowSac
 
 
 A neural network that learns to calibrate NOAA's operational snowmelt and soil-moisture models across many river basins at once, including ones it has never seen, while leaving NOAA's original Fortran code untouched.

@@ -363,7 +363,7 @@ shape. These tests are not optional.
 ## Repo layout
 
 ```
-dsnow17-sacsma/                  # settled name (was dsnow17-hbv)
+dsnowsac/                        # δSnowSac; renamed from dsnow17-sacsma (was dsnow17-hbv)
 ├── LICENSE                      # Apache-2.0, first commit
 ├── NOTICE                       # credit NOAA-OWP/snow17 AND NOAA-OWP/sac-sma
 ├── README.md                    # one-command reproduction; dependency-vs-
