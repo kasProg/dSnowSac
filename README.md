@@ -93,7 +93,7 @@ Snow-17 and SAC-SMA as separate modules, and a standalone Snow-17
 Tesseract is reusable with any downstream rainfall-runoff model, not
 just this one.
 
-**Why forward mode.** Snow-17's parameters reach the loss only through
+<!-- **Why forward mode.** Snow-17's parameters reach the loss only through
 RAIM, a full daily time series (~3,650 values). A reverse-mode
 composition would ask SAC-SMA for `d(runoff)/d(RAIM)` — a dense
 Jacobian against that intermediate flux, which finite differences can
@@ -115,7 +115,7 @@ scratch, so one gradient takes about 126 Fortran runs per basin, against
 per epoch instead of about 5 s, most of it per-call Tesseract overhead
 rather than Fortran. That is the price of the gradient crossing the
 container boundary on Tesseract's own machinery rather than on custom
-code; `test_coupled_gradient_rollout_budget` keeps it from growing.
+code; `test_coupled_gradient_rollout_budget` keeps it from growing. -->
 
 Both containers are built and gradient-checked end-to-end — against
 autograd ground truth and an independent brute-force check on cheap
