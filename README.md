@@ -102,11 +102,20 @@ never forms it. With few inputs (27 parameters), one wide intermediate
 flux, and a scalar loss, forward mode is the natural fit: its cost is
 one pass per parameter (independent of series length), and Tesseract's
 own forward-mode composition carries the RAIM tangent across the
-container boundary for free. The gradient path is entirely Tesseract's
+container boundary. The gradient path is entirely Tesseract's
 own machinery — there is no hand-written cross-container gradient code.
 Forward mode differentiates the physics; the upstream network trains by
 ordinary reverse-mode autograd, the two joined at the parameter vector
 (see [src/coupling.py](src/coupling.py)).
+
+**What it costs.** Each of the 27 passes re-runs both models from
+scratch, so one gradient takes about 126 Fortran runs per basin, against
+63 for the hand-written cross-container coupling this replaced (see
+[notes/logs.md](notes/logs.md)). In practice training takes about 50 s
+per epoch instead of about 5 s, most of it per-call Tesseract overhead
+rather than Fortran. That is the price of the gradient crossing the
+container boundary on Tesseract's own machinery rather than on custom
+code; `test_coupled_gradient_rollout_budget` keeps it from growing.
 
 Both containers are built and gradient-checked end-to-end — against
 autograd ground truth and an independent brute-force check on cheap
@@ -152,12 +161,15 @@ basin is one of the best held-out fits (NSE 0.82). The bottom one is
 near the median (NSE 0.69): it starts spring melt a little late and
 overshoots the 1997 peak. Regenerate with `results/plot_hydrograph.py`.*
 
-> These numbers are from a run trained under the previous reverse-mode
-> coupling; the gradient path has since been rewritten to forward-mode
-> Tesseract composition (gradient-equivalent, see the test suite). The
-> committed checkpoint still reloads and scores as recorded, but a fresh
-> training run under the current code has not yet been committed — see
-> [results/README.md](results/README.md) for the full note.
+> These numbers come from the published run, trained with an earlier,
+> hand-written cross-container coupling. Retrained from scratch with the
+> current forward-mode code (same config and seed,
+> `results/runs/model_9yrs_spatial_fwdmode/`), the model reaches median
+> NSE 0.84 on training basins and 0.73 on held-out basins. Basin by basin,
+> 5 of the 10 held-out basins improve and 5 get worse (mean held-out NSE
+> 0.66 → 0.62), so this reproduces the result within run-to-run
+> variation rather than improving on it. See
+> [results/README.md](results/README.md).
 
 For comparison, a properly engineered LSTM
 ([NeuralHydrology](https://github.com/neuralhydrology/neuralhydrology))
@@ -201,7 +213,7 @@ data/download_camels.sh
 .venv/bin/python data/build_pet.py
 .venv/bin/python data/build_climatology.py
 
-.venv/bin/python src/train.py                                  # trains the hybrid model (~13 min, CPU)
+.venv/bin/python src/train.py                                  # trains the hybrid model (~2 h, CPU)
 .venv/bin/python src/infer.py checkpoint=results/runs/model_9yrs_spatial/checkpoint.pt
 ```
 
@@ -232,7 +244,7 @@ src/paramnet.py                       LSTM + MLP: attributes/climatology -> 27 b
 src/train.py, src/infer.py            Hydra-driven training / checkpoint scoring CLIs
 configs/                              Hydra config groups (data/split/model/train)
 data/                                 CAMELS download + basin selection + attribute/PET/climatology prep
-tests/                                shim determinism/mass-balance, VJP checks, coupled-chain regression
+tests/                                shim determinism/mass-balance, JVP/VJP checks, coupled-chain regression
 notes/NOTES.md                        upstream Fortran findings, with a before/after proof
 notes/logs.md                         design-decision rationale log
 results/                              saved, seeded, reproducible run directories + external comparisons

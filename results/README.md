@@ -20,29 +20,21 @@ results/runs/<name>/
 
 ## `runs/model_9yrs_spatial/` -- primary result
 
-> **⚠️ Stale w.r.t. current code — retrain pending.** This run was trained
-> under the previous *reverse-mode* cross-container coupling. The gradient
-> path has since been rewritten to *forward-mode* Tesseract composition
-> (see `src/coupling.py` and notes/logs.md, 2026-09-22). The two are
-> gradient-equivalent up to finite-difference noise — the test suite checks
-> the coupled gradient against an independent brute-force FD through both
-> real Fortran models — and the forward pass is unchanged, so the committed
-> `checkpoint.pt` still reloads and scores as recorded via `src/infer.py`.
-> But re-running training now follows a different optimization trajectory
-> and will not reproduce the exact numbers below. A fresh run under the new
-> code has not yet been committed; the table and `test_predictions.json`
-> reflect the prior run. Treat the numbers as indicative, not as the
-> current code's reproducible output, until this run is regenerated.
+> **Trained under the previous coupling.** This run used the earlier
+> hand-written cross-container coupling. The gradient path has since been
+> rewritten to *forward-mode* Tesseract composition (see `src/coupling.py`
+> and notes/logs.md, 2026-09-22 and 2026-09-27). The forward pass is
+> unchanged, so `checkpoint.pt` still reloads and scores as recorded via
+> `src/infer.py`, but re-running training now follows a slightly different
+> optimization trajectory. The current code's reproduction of this run is
+> `runs/model_9yrs_spatial_fwdmode/` below.
 
 Snow17 + SAC-SMA + `ParamNet` (LSTM climatology encoder + static
 attributes -> 27 bounded physical parameters), trained end-to-end
 through both Tesseracts via `src/coupling.py`. 35 train / 10 heldout
 basins (`split=spatial`), WY1991-1999 (9-year) window, 150 epochs,
-~13 minutes total. This is `configs/`'s current default; regenerate with:
-
-```bash
-.venv/bin/python src/train.py output_dir=results/runs/model_9yrs_spatial
-```
+~13 minutes total under the previous coupling. This is `configs/`'s
+current default.
 
 | epoch | median train NSE | median test (heldout) NSE |
 |---|---|---|
@@ -53,6 +45,35 @@ Train/test gap at epoch 150: **~0.14** -- held-out basins track training
 basins closely throughout, no overfitting observed at this scale.
 Per-basin simulated streamflow + NSE for all 10 test basins at this
 final epoch: `runs/model_9yrs_spatial/test_predictions.json`.
+
+## `runs/model_9yrs_spatial_fwdmode/` -- reproduction under the current code
+
+The same config and seed as the run above, retrained from scratch with
+the current forward-mode coupling:
+
+```bash
+.venv/bin/python src/train.py output_dir=results/runs/model_9yrs_spatial_fwdmode
+```
+
+| epoch | median train NSE | median test (heldout) NSE |
+|---|---|---|
+| 1 | +0.38 | +0.28 |
+| 150 (final) | **+0.84** | **+0.73** |
+
+Epoch 1 matches the run above exactly (same initial network, same
+forward pass). By epoch 150 the training score is unchanged, and the
+median held-out score is 0.03 higher. That is not an improvement: basin
+by basin, 5 of the 10 held-out basins get better and 5 get worse, the
+largest change being `13313000` dropping from 0.33 to -0.02, and the
+mean held-out NSE falls from 0.66 to 0.62. Within this run, the median
+held-out score also ranges from 0.69 to 0.73 across its last five
+evaluations. Read it as the same
+result within run-to-run variation; this project has no multi-seed
+estimate of that variation yet.
+
+Cost: **~50 s/epoch, ~2 h total** (vs. ~5 s/epoch before) -- each
+gradient now takes ~126 Fortran runs per basin instead of 63, plus
+per-call Tesseract overhead (see notes/logs.md, 2026-09-27).
 
 ## External reference: a properly-engineered LSTM
 

@@ -28,13 +28,15 @@ data/camels/*
 
 # src/train.py's default output_dir is timestamped
 # (results/runs/<model>_<split>_<timestamp>/) -- exploratory runs
-# shouldn't accumulate in git. Exactly one canonical, reproducible
-# reference run is kept (results/README.md). Previously also kept a
+# shouldn't accumulate in git. One canonical, reproducible reference run
+# is kept, plus its reproduction under the current forward-mode coupling
+# (results/README.md). Previously also kept a
 # 3-year pilot run and (earlier still) two benchmark_lstm run dirs --
 # both removed along with the code/results they belonged to; see
 # notes/logs.md.
 results/runs/*
 !results/runs/model_9yrs_spatial/
+!results/runs/model_9yrs_spatial_fwdmode/
 # Hydra's own job-logging artifacts (.hydra/, train.log) -- present when
 # a run went through cli()'s @hydra.main path rather than run_training()
 # called directly; not part of the run's actual content (config.yaml/

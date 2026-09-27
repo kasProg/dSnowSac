@@ -1647,3 +1647,11 @@ torch skipping zero tangents, or the helper skipping zero-tangent groups).
 **Pin:** per-path `eps` mappings only exist from tesseract-core 1.14.0; on
 1.11.0 every endpoint using them fails. `requirements.txt` and the CI
 install step now say `>=1.14`.
+
+**Retrained under the new code** (`results/runs/model_9yrs_spatial_fwdmode/`,
+same config and seed as `model_9yrs_spatial`): epoch 1 identical (0.376
+train / 0.282 held-out); epoch 150 median train 0.843 (was 0.844), median
+held-out 0.730 (was 0.704). Per basin 5 up / 5 down, mean held-out 0.62
+(was 0.66), `13313000` 0.33 → -0.02. Reported as a reproduction within
+run-to-run variation, not an improvement. Kept `model_9yrs_spatial` as the
+README headline. Cost in practice: 50.4 s/epoch (was 4.7), 126 min total.

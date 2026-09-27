@@ -1,0 +1,24 @@
+data:
+  name: camels_snow35
+  camels_dir: data/camels
+  selected_basins_csv: data/camels/selected_basins.csv
+  attributes_npz: data/camels/basin_attributes.npz
+  climatology_npz: data/camels/basin_climatology.npz
+split:
+  mode: spatial
+  window:
+    start: '1990-10-01'
+    end: '1999-09-30'
+model:
+  name: hybrid
+  lstm_hidden: 32
+  mlp_hidden: 64
+  n_hidden_layers: 2
+  dropout: 0.1
+train:
+  n_epochs: 150
+  eval_every: 3
+  lr: 0.003
+  checkpoint_every: 10
+seed: 0
+output_dir: results/runs/model_9yrs_spatial_fwdmode
