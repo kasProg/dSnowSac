@@ -2,6 +2,6 @@ numpy
 pandas
 pytest
 torch
-tesseract-core[runtime]
+tesseract-core[runtime]>=1.14  # per-input eps in the finite-difference helpers
 tesseract-torch
 hydra-core

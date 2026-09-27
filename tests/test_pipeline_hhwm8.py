@@ -216,3 +216,44 @@ def test_coupled_gradient_matches_independent_brute_force_fd(hhwm8_setup):
             f"theta_B[{j}] ({SACSMA_PARAMS[j]}): forward-mode {grad_B_fwd[j]:.6g} "
             f"vs brute-force FD {ref:.6g}"
         )
+
+
+def test_coupled_gradient_rollout_budget(hhwm8_setup, monkeypatch):
+    """Cost regression guard: one forward+backward through the coupled
+    chain must stay near 3 rollouts per model per parameter pass (plain
+    run + central pair), not one central pair per parameter per pass.
+
+    The failure this catches is silent -- gradients stay correct, only the
+    run count explodes. tesseract-torch hands each jacobian_vector_product
+    every differentiable input, zero tangents included; without the
+    zero-tangent filter in both tesseract_api.py files the HHWM8 water year
+    cost 513 Snow17 + 729 SAC-SMA rollouts (vs 49 + 77 with it).
+    """
+    import sacsma
+    import snow17
+
+    _, snow17_forcing, sacsma_forcing, theta_A_true, theta_B_true = hhwm8_setup
+    counts = {"snow17": 0, "sacsma": 0}
+
+    def counting(fn, key):
+        def wrapped(*args, **kwargs):
+            counts[key] += 1
+            return fn(*args, **kwargs)
+        return wrapped
+
+    # Patch before building the stack: each tesseract_api.py binds
+    # run_snow17 / run_sacsma by name when it is loaded.
+    monkeypatch.setattr(snow17, "run_snow17", counting(snow17.run_snow17, "snow17"))
+    monkeypatch.setattr(sacsma, "run_sacsma", counting(sacsma.run_sacsma, "sacsma"))
+    stack = CoupledNWSStack()
+
+    theta_A = torch.tensor(theta_A_true, dtype=torch.float32, requires_grad=True)
+    theta_B = torch.tensor(theta_B_true, dtype=torch.float64, requires_grad=True)
+    stack.run(theta_A, theta_B, snow17_forcing, sacsma_forcing).sum().backward()
+
+    n_a, n_b = len(SNOW17_PARAMS), len(SACSMA_PARAMS)
+    # Snow17: plain + central pair on its own passes, plain only on SAC-SMA's.
+    # SAC-SMA: plain + central pair on every pass (fewer when a Snow17
+    # parameter has exactly zero effect on RAIM, e.g. SI/PXTEMP here).
+    assert 0 < counts["snow17"] <= 3 * n_a + n_b, counts
+    assert 0 < counts["sacsma"] <= 3 * (n_a + n_b), counts

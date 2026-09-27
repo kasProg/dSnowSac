@@ -238,15 +238,25 @@ def jacobian_vector_product(
             f"jacobian_vector_product only supports {DIFFERENTIABLE_INPUTS}, "
             f"got unsupported input(s): {sorted(unsupported)}"
         )
+    # Drop zero-tangent inputs before differencing -- see the identical
+    # step in tesseracts/snow17/tesseract_api.py's jacobian_vector_product.
+    # Here it also covers pcp: on the 16 SAC-SMA-parameter passes the
+    # incoming RAIM tangent is all zeros, since Snow17 had nothing seeded.
+    active = {name for name in jvp_inputs if np.any(np.asarray(tangent_vector[name]))}
+    if not active:
+        n = len(inputs.pcp)
+        return {name: np.zeros(n, dtype=np.float64) for name in jvp_outputs}
     eps: dict[str, float] = {
         name: _fd_step(float(getattr(inputs, name)))
-        for name in jvp_inputs
+        for name in active
         if name != "pcp"
     }
-    if "pcp" in jvp_inputs:
+    if "pcp" in active:
         eps["pcp"] = _pcp_eps(inputs, tangent_vector["pcp"])
     return finite_difference_jvp(
-        apply, inputs, jvp_inputs, jvp_outputs, tangent_vector, algorithm="central", eps=eps
+        apply, inputs, active, jvp_outputs,
+        {name: tangent_vector[name] for name in active},
+        algorithm="central", eps=eps,
     )
 
 

@@ -229,8 +229,20 @@ def jacobian_vector_product(
     via tesseract-core's finite_difference_jvp. This is the endpoint the
     coupled forward-mode pipeline drives."""
     eps = _fd_eps(inputs, jvp_inputs, "jacobian_vector_product")
+    # tesseract-torch lists EVERY differentiable input here, zero tangents
+    # included -- in the coupled pipeline's one-parameter-per-pass seeding,
+    # that's 10 of 11 on each pass. The helper spends a central pair per
+    # distinct eps, so those contribute nothing but rollouts (~10x the cost
+    # measured on HHWM8). Drop them; with nothing left, the output tangent
+    # is exactly zero and no rollout is needed.
+    active = {name for name in jvp_inputs if np.any(np.asarray(tangent_vector[name]))}
+    if not active:
+        n = len(inputs.pcp)
+        return {name: np.zeros(n, dtype=np.float32) for name in jvp_outputs}
     out = finite_difference_jvp(
-        apply, inputs, jvp_inputs, jvp_outputs, tangent_vector, algorithm="central", eps=eps
+        apply, inputs, active, jvp_outputs,
+        {name: tangent_vector[name] for name in active},
+        algorithm="central", eps={name: eps[name] for name in active},
     )
     return {name: np.asarray(out[name], dtype=np.float32) for name in jvp_outputs}
 

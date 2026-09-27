@@ -52,7 +52,7 @@ jobs:
       - name: Install tesseract-core
         run: |
           uv venv .venv --python 3.11
-          uv pip install --python .venv/bin/python "tesseract-core[runtime]" numpy pytest
+          uv pip install --python .venv/bin/python "tesseract-core[runtime]>=1.14" numpy pytest
 
       # No --tag: tesseract_config.yaml's `name:` + the default `latest`
       # tag (per `tesseract build --help`) give snow17:latest / sacsma:latest.

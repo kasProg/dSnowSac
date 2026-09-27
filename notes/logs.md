@@ -1609,3 +1609,41 @@ and well-tested. Judged worth it for the code deletion and the cleaner
 framing; the full gradient test suite (incl. the coupled brute-force-FD
 check through both real Fortran models) is the safety net and stays green
 (78 passed, 5 skipped).
+
+## 2026-09-27 — Zero-tangent inputs dropped before finite differencing; tesseract-core pinned >=1.14
+
+**Found on review of the forward-mode switch:** gradients were correct
+(matched the old reverse-mode path to ~1e-7 on Snow17 parameters, ≤3e-3 on
+SAC-SMA's, the gap being one-sided vs. central differencing) but one
+forward+backward on the HHWM8 water year cost **513 Snow17 + 729 SAC-SMA
+rollouts** (2.84 s), against 23 + 40 (0.10 s) before.
+
+**Cause:** `_parameter_jacobian` seeds one parameter per pass, but
+tesseract-torch passes every differentiable input to
+`jacobian_vector_product`, zero tangents included — reseeding the other
+parameters as plain tensors doesn't help, the tangents arrive as zeros
+either way. `finite_difference_jvp` groups inputs by `eps` and spends a
+central pair per group; with relative steps, nearly every parameter is its
+own group. So each pass nudged ~11 (Snow17) or ~13 (SAC-SMA) groups where
+only one had a non-zero tangent.
+
+**Fix:** both `jacobian_vector_product` endpoints drop inputs whose tangent
+is all zeros before calling the helper, and return exact zeros without a
+rollout when nothing is left (Snow17 on SAC-SMA-parameter passes). Result:
+**49 + 77 rollouts (0.66 s)**, gradients bitwise identical to the unfiltered
+version. `test_coupled_gradient_rollout_budget` guards it — verified to fail
+(513/729) with the filter removed.
+
+**Honest remaining cost:** 126 rollouts vs. the old 63. Each of the 27
+passes re-runs both models un-nudged (the old code ran that once and
+reused it), SAC-SMA-parameter passes re-run Snow17 though its output can't
+change, and SAC-SMA parameters now take a central pair instead of a
+one-sided step. Recovering the 63 would mean caching around Tesseract's
+composition — i.e. reintroducing hand-written orchestration. Not done:
+~2x rollouts is the price of the gradient crossing containers on
+Tesseract's own machinery. Arguably the filter belongs upstream (tesseract-
+torch skipping zero tangents, or the helper skipping zero-tangent groups).
+
+**Pin:** per-path `eps` mappings only exist from tesseract-core 1.14.0; on
+1.11.0 every endpoint using them fails. `requirements.txt` and the CI
+install step now say `>=1.14`.
