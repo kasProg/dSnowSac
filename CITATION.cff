@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "δsnow17-sacsma: learning parameters of NOAA's operational Snow-17 and SAC-SMA models through unmodified Fortran"
+type: software
+authors:
+  - given-names: Kamlesh
+    family-names: Sawadekar
+    orcid: "https://orcid.org/0009-0002-9011-5399"
+repository-code: "https://github.com/kasProg/dsnow17-sacsma"
+license: Apache-2.0
+abstract: >-
+  A neural network learns the parameters of NOAA's operational Snow-17
+  snowmelt and SAC-SMA soil-moisture models across many basins at once.
+  Both models are unmodified Fortran, wrapped as composed Tesseract
+  containers with finite-difference gradients, and trained end to end on
+  CAMELS streamflow.
+keywords:
+  - hydrology
+  - differentiable modeling
+  - hybrid modeling
+  - snowmelt
+  - streamflow
+  - Tesseract
+  - Fortran

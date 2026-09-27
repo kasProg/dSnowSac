@@ -76,3 +76,6 @@ torchinductor_*/
 # OS / editor
 .DS_Store
 .vscode/
+
+# results/animate_training.py simulation cache (regenerated in ~20s)
+results/.animate_cache.npz

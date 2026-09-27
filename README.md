@@ -1,48 +1,55 @@
-# 𝛿snow17-sacsma
+# δsnow17-sacsma
 
-*Built for the Pasteur Labs Tesseract Hackathon 2026 — Track 03: Hybrid
-ML + mechanistic models.*
 
-## The problem
+A neural network that learns to calibrate NOAA's operational snowmelt and soil-moisture models across many river basins at once, including ones it has never seen, while leaving NOAA's original Fortran code untouched.
 
-NOAA's River Forecast Centers have run Snow-17 and SAC-SMA in
-production since the 1970s — a snowmelt model and a soil-moisture
-accounting model, hand-calibrated basin by basin by hydrologists, to
-forecast streamflow across the country. That calibration process still
-doesn't scale: NOAA maintains it for a few thousand forecast points,
-and the vast majority of U.S. stream reaches have never been
-individually calibrated at all.
+Every day, NOAA forecasts river flow across the U.S. using two models written in
+the 1970s: one for snowmelt, one for soil moisture. Before these models can be
+used on a river, hydrologists usually have to tune these models with respect to each of the basins, creating a need for workflows that enable automated calibrations across multiple basins.
 
-The obvious fix already exists in the literature — train a neural
-network across many basins at once so it learns what calibration *is*,
-instead of hand-tuning one basin at a time, and it generalizes to
-basins nobody calibrated. NeuralHydrology-style LSTMs already do this,
-well. But they throw the physics away to do it: a black-box streamflow
-number, with no melt factor or soil-moisture capacity behind it and no
-conservation of mass to check, isn't something an operational
-forecaster can audit the way they audit SAC-SMA's actual state
-variables.
+Machine learning has already shown potential to learn calibration across many basins at once. However, pure data driven models (like rainfall-runoff LSTMs) don't expose familiar hydrologic states or parameters that forecasters use for diagnosis and turn the problem into a typical ML black box. Another class of models called the differentiable hydrological models provide a better alternative by having a neural network learn parameters for physics model, and optimize end-to-end based on final loss function. However, this requires rewriting the physics model in a framework like Jax or PyTorch. I didn't do this.  
 
-The differentiable-parameter-learning line of work wants both: keep
-the physical model, let a neural network learn its parameters
-end-to-end the way anything else gets trained by gradient descent. It
-almost always gets there by rewriting the physics in JAX or PyTorch
-first, because autograd needs a recorded graph and compiled Fortran
-leaves none behind — meaning what gets learned describes a
-reimplementation, not the model actually issuing NOAA's forecasts.
+By leveraging Tesseract, the original Fortran NOAA models (Snow-17 and
+SAC-SMA) that run in production are left untouched, and the neural network
+is trained *through* them by gradient descent. What the network learns are
+the parameters of the real operational models: melt rates, snowfall
+correction, soil-water storage capacities, drainage rates, among 27 in total.
 
-That's the wall this project runs into directly, and it's exactly the
-shape of problem [Tesseract](https://github.com/pasteurlabs/tesseract)
-exists to solve: wrap an existing solver - so it becomes a composable layer any training loop can pull
-real gradients through. The actual Fortran NOAA runs,
-unmodified, with a neural network learning to calibrate it.
+Trained on 35 snowy basins and tested on 10 it never saw, the model reaches a
+median NSE of 0.70 on the unseen basins (NSE: 1 = perfect, 0 = no better than
+predicting average flow every day; ~0.7+ is usually considered usable).
+A pure-ML LSTM does better on accuracy (0.795), but what you get in exchange
+is a model a forecaster can actually open up: every prediction comes with
+physical parameters and states (snowpack, soil moisture) that can be
+inspected, audited, and compared against how NOAA already calibrates these
+basins.
 
-## Architecture
+![Animation: simulated streamflow in a held-out basin converging onto the observed hydrograph as training progresses, NSE rising from -0.42 to +0.82](results/training_heldout.gif)
 
-Two composed Tesseract containers wrap Snow-17 and SAC-SMA end to end;
-an LSTM+MLP learns both models' parameters directly from basin
-attributes by backpropagating a streamflow loss through the coupled
-Fortran physics:
+*The network learning to calibrate NOAA's Fortran models, shown on a
+basin it never trained on. Every frame is real model output from a
+saved checkpoint, run through both unmodified Fortran models. The
+untrained network roughly doubles the snowmelt peak (NSE -0.42, worse
+than predicting the average flow). By the end of training it tracks
+the observed flow (NSE +0.82). This basin was chosen because the
+learning is most visible there, and it ends among the better fits. The
+curves underneath are the honest summary: median NSE across all 10
+held-out basins (0.23 untrained to 0.70) and across the 35 training
+basins (0.38 to 0.84). Regenerate with
+`results/animate_training.py`.*
+
+## How it works
+
+Snow-17 and SAC-SMA are compiled Fortran, so PyTorch's autograd cannot
+see inside them and backpropagation stops at their boundary. This
+project does not rewrite them. Each model is wrapped, unmodified, in
+its own [Tesseract](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/)
+container. Each container exposes a forward run and a
+finite-difference gradient, and
+[`tesseract-torch`](https://github.com/pasteurlabs/tesseract-torch)
+splices both into the PyTorch graph as ordinary differentiable layers.
+A neural network can then learn the parameters of NOAA's operational
+code directly, rather than the parameters of a reimplementation of it.
 
 ```mermaid
 flowchart LR
@@ -63,63 +70,69 @@ flowchart LR
     LOSS -. "θ_A: perturb + rerun both models" .-> NET
 ```
 
-Solid arrows are the forward pass. The two dashed arrows are gradients,
-and they're deliberately not symmetric: θ_B's uses SAC-SMA's own
-Tesseract VJP endpoint directly. θ_A's doesn't — Snow-17's parameters
-only reach the loss through RAIM (~3,650 daily values), and no
-Tesseract's VJP can differentiate a downstream container it doesn't
-own, so θ_A's gradient instead perturbs each Snow-17 parameter and
-reruns both models, reading how the final runoff moved. Snow-17
-produces RAIM (rain-plus-melt) — the same coupling flux NOAA runs
-operationally into SAC-SMA — so the container boundary sits at a real,
-existing operational seam.
+Solid arrows are the forward pass. The two dashed arrows are
+gradients, and they are deliberately not symmetric. θ_B's gradient
+uses SAC-SMA's own Tesseract VJP endpoint directly. θ_A's cannot:
+Snow-17's parameters reach the loss only through RAIM, which has thousands of  daily values. No Tesseract's VJP can differentiate a downstream
+container it does not own. So θ_A's gradient perturbs each Snow-17
+parameter, reruns both models, and reads how the final runoff moved.
+RAIM (rain-plus-melt) is the same coupling flux NOAA runs
+operationally from Snow-17 into SAC-SMA, so the container boundary
+sits at a real, existing operational seam.
 
-## Why Tesseract
+There are two containers rather than one because NOAA maintains
+Snow-17 and SAC-SMA as separate modules. A standalone Snow-17
+Tesseract can be reused with any downstream rainfall-runoff model, not
+just this one.
 
-PyTorch's `.backward()` walks a recorded graph — Snow-17 and SAC-SMA
-are compiled Fortran, so nothing is recorded and autodiff stops cold.
-Each model is wrapped as its own Tesseract exposing `apply()` and a
-finite-difference `vector_jacobian_product()`; `tesseract-torch` splices
-both into the autograd graph as ordinary differentiable layers. Two
-Tesseracts are composed here: NOAA maintains Snow-17 and SAC-SMA as separate
-modules, and a standalone Snow-17 Tesseract is reusable with any
-downstream rainfall-runoff model, not just this one.
+Both containers are gradient-checked end to end. The coupling logic is
+checked first against autograd ground truth and an independent
+brute-force check on cheap stand-ins (`tests/test_coupling_toy.py`),
+then against the real Tesseracts (`tests/test_pipeline_hhwm8.py`,
+`tests/test_gradients.py`). On every push, CI runs `tesseract build`
+for both containers from scratch and smoke-tests `apply()` against the
+built images ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
 
-Both containers are built and gradient-checked end-to-end — against
-autograd ground truth and an independent brute-force check on cheap
-stand-ins first (`tests/test_coupling_toy.py`), then against the real
-Tesseracts (`tests/test_pipeline_hhwm8.py`, `tests/test_gradients.py`).
-`tesseract build` runs in CI on every push, building both containers
-from scratch and smoke-testing `apply()` against the built images (see
-[.github/workflows/ci.yml](.github/workflows/ci.yml)).
 
 ## Results
 
-*(NSE — Nash-Sutcliffe Efficiency — is the standard skill metric for
-streamflow models below. 1.0 is a perfect match to observed flow; 0
-means the model is no better than just guessing the historical average
-every day; negative is worse than that. There's no fixed ceiling below
-1.0 — "good" is domain- and basin-dependent, but 0.7+ is generally
-read as a solid, usable forecast.)*
+*NSE (Nash-Sutcliffe Efficiency) is the standard skill metric for
+streamflow models. 1.0 is a perfect match to observed flow. 0 means
+the model is no better than guessing the historical average every day,
+and a negative value is worse than that. What counts as good depends
+on the domain and the basin, but 0.7 or higher is generally read as a
+solid, usable model.*
 
 `ParamNet` predicts all 27 learnable parameters (11 Snow-17 + 16
 SAC-SMA) from each basin's static CAMELS attributes plus a climatology
-sequence, trained end-to-end across 35 snow-dominated CAMELS basins
-with 10 held out (WY1991-1999, spatial holdout — prediction in
-ungauged basins):
+sequence. It is trained end to end across 35 snow-dominated CAMELS
+basins, and 10 more basins are held out (WY1991-1999). The held-out
+basins test spatial generalization, which is the same problem as
+predicting flow in ungauged basins.
 
 | | median train NSE | median held-out NSE |
 |---|---|---|
 | epoch 1 | +0.38 | +0.28 |
 | epoch 150 (final) | **+0.84** | **+0.70** |
 
-Held-out basins track training basins closely throughout (gap ~0.14) —
-no overfitting observed at this scale. Full numbers and reproduction
-commands: [results/README.md](results/README.md).
+Held-out skill rises quickly and then plateaus. Most of the held-out
+gain comes in the first ~10 epochs, while training NSE keeps improving,
+so the train/held-out gap widens to about 0.14 by epoch 150. Held-out
+NSE never declines, so this is limited generalization from 35 basins
+rather than overfitting. Full numbers and
+reproduction commands are in [results/README.md](results/README.md).
 
-Checked honestly against a properly-engineered LSTM
-([NeuralHydrology](https://github.com/neuralhydrology/neuralhydrology)),
-trained and tested on the *exact same* 35/10 basin split:
+![Simulated vs. observed daily streamflow for two held-out basins over water years 1996-1997](results/hydrograph_heldout.png)
+
+*Daily streamflow in two held-out basins after training. The black
+line is the USGS gauge and the blue line is the hybrid model. The top
+basin is one of the best held-out fits (NSE 0.82). The bottom one is
+near the median (NSE 0.69): it starts spring melt a little late and
+overshoots the 1997 peak. Regenerate with `results/plot_hydrograph.py`.*
+
+For comparison, a properly engineered LSTM
+([NeuralHydrology](https://github.com/neuralhydrology/neuralhydrology))
+was trained and tested on the *exact same* 35/10 basin split:
 
 | model | median held-out NSE |
 |---|---|
@@ -128,18 +141,17 @@ trained and tested on the *exact same* 35/10 basin split:
 
 ![Held-out NSE per basin, hybrid model vs. NeuralHydrology LSTM](results/basin_nse_comparison.png)
 
-The medians above compress this down to two numbers; basin by basin
-it's closer than that — the LSTM leads on 6 of 10, the hybrid model
-wins on 4, and the gap ranges from essentially tied (`09035900`,
-0.822 vs. 0.809) to wide open (`11230500`, 0.408 vs. 0.827).
-(Regenerate with `results/plot_basin_comparison.py`.)
+Basin by basin, the gap is smaller than the medians suggest. The LSTM
+leads on 6 of 10 basins and the hybrid model wins on 4. The gap ranges
+from essentially tied (`09035900`, 0.822 vs. 0.809) to wide
+(`11230500`, 0.408 vs. 0.827). Regenerate with
+`results/plot_basin_comparison.py`.
 
-Against a competent LSTM, this hybrid model currently trails on raw
-NSE — see [results/external/neuralhydrology_lstm_pub/](results/external/neuralhydrology_lstm_pub/README.md).
-That's not the claim this project is making, though: the point was
-never "beat an LSTM," it was learning NOAA's *actual* operational
-parameters end-to-end without rewriting the physics — see The problem,
-above.
+On raw NSE, the hybrid model currently trails a competent LSTM (see
+[results/external/neuralhydrology_lstm_pub/](results/external/neuralhydrology_lstm_pub/README.md)).
+Beating an LSTM was never the goal. The goal was to learn the
+parameters of NOAA's *actual* operational models end to end, without
+rewriting the physics.
 
 ## Reproduce
 
@@ -150,8 +162,8 @@ git submodule update --init --recursive   # vendors NOAA-OWP/snow17 + sac-sma, p
 make test                                  # creates .venv, builds Fortran shims, runs pytest
 ```
 
-Multi-basin training needs CAMELS data (~3.4GB, one-time, not fetched
-by `make test`):
+Multi-basin training needs CAMELS data (about 3.4 GB, downloaded once;
+`make test` does not fetch it):
 
 ```bash
 data/download_camels.sh
@@ -164,19 +176,20 @@ data/download_camels.sh
 .venv/bin/python src/infer.py checkpoint=results/runs/model_9yrs_spatial/checkpoint.pt
 ```
 
-Training/inference are driven by [Hydra](https://hydra.cc/) configs
-under `configs/` (data / split / model / train) rather than hardcoded
-constants — override anything from the CLI, e.g. `seed=1` or
-`split.window.end=1993-09-30`. Everything runs on CPU; the
-Fortran/Tesseract calls (finite-difference gradients) are the
-bottleneck, not model size, so a GPU wouldn't help. See
+Training and inference are driven by [Hydra](https://hydra.cc/)
+configs under `configs/` (data / split / model / train), not hardcoded
+constants. Override anything from the CLI, e.g. `seed=1` or
+`split.window.end=1993-09-30`. Everything runs on CPU. The bottleneck
+is the Fortran/Tesseract calls (finite-difference gradients), not
+model size, so a GPU would not help. See
 [results/README.md](results/README.md) for saved runs and
 `results/compare_runs.py` for comparing them.
 
-**Docker note:** day-to-day `apply()`/`vector_jacobian_product()`
-development runs through `tesseract_core.Tesseract.from_tesseract_api()`
-directly (no container needed); actual `tesseract build` runs in CI,
-where Docker is available.
+**Docker note:** day-to-day development of `apply()` and
+`vector_jacobian_product()` calls
+`tesseract_core.Tesseract.from_tesseract_api()` directly, with no
+container. The actual `tesseract build` runs in CI, where Docker is
+available.
 
 ## Layout
 
@@ -197,13 +210,32 @@ notes/logs.md                         design-decision rationale log
 results/                              saved, seeded, reproducible run directories + external comparisons
 ```
 
+## Status and what's next
+
+
+- **Status:** research prototype.  The core pipeline works and is tested end to
+  end. Development is to be continued.
+- **Contributions:**  issues are very welcome (bug reports, questions, ideas,
+  basins where it fails). If you'd like to contribute code, please open an
+  issue first so we can agree on the approach; the codebase is still moving.
+- **Contact:** [Kamlesh Sawadekar](https://www.linkedin.com/in/kamlesh-sawadekar/) on LinkedIn, or email kas7897 [at] psu [dot] edu
+- **Citation:** if you use this work, please cite it using the "Cite this
+  repository" button on GitHub (from `CITATION.cff`).
+
+## Origin
+
+This project started at the
+[Pasteur Labs Tesseract Hackathon 2026](https://pasteurlabs.ai/tesseract-hackathon-2026/)
+(Track 03: Hybrid ML + mechanistic models)
+<!-- TODO: replace the link once the announcement is live. -->
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Snow-17 is
 vendored and linked against **unmodified**. SAC-SMA is vendored
-unmodified as a pinned submodule; one disclosed, minimal patch is
+unmodified as a pinned submodule. One disclosed, minimal patch is
 applied to a **build-time copy only** to fix a confirmed upstream
-defect — `external/sac-sma` itself is never modified. "Original work"
-applies to this submission, not its dependency tree: the shims,
-patches, Tesseract wrappers, gradient endpoints, and training pipeline
-are original work written during the hackathon period (Aug 3-31, 2026).
+defect; `external/sac-sma` itself is never modified. "Original work"
+applies to this project, not its dependency tree: the shims, patches,
+Tesseract wrappers, gradient endpoints, and training pipeline are
+original work written during the hackathon period (Aug 3-31, 2026).
