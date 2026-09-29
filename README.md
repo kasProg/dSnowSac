@@ -51,23 +51,7 @@ splices both into the PyTorch graph as ordinary differentiable layers.
 A neural network can then learn the parameters of NOAA's operational
 code directly, rather than the parameters of a reimplementation of it.
 
-```mermaid
-flowchart LR
-    ATTR["CAMELS attributes<br/>+ Monthly climatology"] --> NET["ParamNet<br/>(LSTM + MLP)"]
-
-    subgraph TESS["Two composed Tesseracts"]
-        direction LR
-        T1["Tesseract A<br/>Snow-17<br/>(NOAA-OWP Fortran)"] -- "RAIM<br/>(rain + melt)" --> T2["Tesseract B<br/>SAC-SMA<br/>(NOAA-OWP Fortran)"]
-    end
-
-    NET -- "θ_A" --> T1
-    NET -- "θ_B" --> T2
-    FORC["precip + temperature"] --> T1
-    PET["PET"] --> T2
-    T2 --> SIM["Simulated<br/>streamflow"] --> LOSS["NSE loss vs.<br/>observed streamflow"]
-
-    LOSS -. "∂loss/∂θ (forward-mode AD)" .-> NET
-```
+![Architecture: ParamNet predicts parameters for two composed Tesseracts, Snow-17 feeding SAC-SMA through RAIM; the NSE loss sends gradients back by two different routes](docs/architecture.png)
 
 Solid arrows are the forward pass; the dashed arrow is the gradient. It
 is computed by **forward-mode** automatic differentiation over the two
