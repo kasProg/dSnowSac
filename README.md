@@ -205,77 +205,162 @@ data/download_camels.sh
 .venv/bin/python data/build_climatology.py
 ```
 
+These build the default set: the 45 most snow-dominated CAMELS basins.
+To train on other basins, see [step 5](#5-use-your-own-basin-list); it
+downloads CAMELS by itself if needed.
+
 ### 3. Train
 
 ```bash
 .venv/bin/python src/train.py
 ```
 
-The defaults reproduce [results/runs/model_9yrs_spatial/](results/runs/model_9yrs_spatial/):
-35 training basins, 10 held-out basins, water years 1991–1999,
-150 epochs. The Fortran runs are spread over `n_workers` processes
-(default 32). One epoch then takes about 2 s on a shared 104-core
-server (about 55 s with `n_workers=0`), so a full run takes under
-10 minutes. Use `train.n_epochs=5` for a quick check that everything
-runs. Each epoch prints a line like
+By default this trains on the 45 snow-dominated basins with the
+temporal split: every basin trains on water years 1991–1993 and is
+tested on 1994–1996. It runs 150 epochs. Each epoch prints a line like
 `epoch  12  train_nse=+0.41  test_nse=+0.38`, where `test_nse` is the
-median NSE on the held-out basins.
+median NSE over the test set. Use `train.n_epochs=5` for a quick check
+that everything runs.
 
-Everything is written to `results/runs/hybrid_spatial_<timestamp>/`:
+Choose the basins with `data=` and the evaluation with `split=`:
+
+| | |
+|---|---|
+| `data=camels_snow35` | 45 most snow-dominated basins (default) |
+| `data=camels_531` | the standard 531-basin CAMELS benchmark subset |
+| `data=camels_671` | all 671 CAMELS basins |
+| `data=camels_list data.basin_list=<file>` | your own list ([step 5](#5-use-your-own-basin-list)) |
+| `split=temporal` | same basins, train and test on different years (default) |
+| `split=spatial` | 80% of basins train, 20% held out, same years (WY1991–1999) |
+
+The 531 and 671 sets are built automatically on first use (about a
+minute). The saved run [results/runs/model_9yrs_spatial/](results/runs/model_9yrs_spatial/)
+is reproduced by `src/train.py split=spatial device=cpu`.
+
+How long it takes: the Fortran runs are spread over `n_workers`
+processes (default 32). On a shared 104-core server:
+
+| Data, split | Time per epoch | 150 epochs |
+|---|---|---|
+| 45 basins, spatial (9 years) | about 2 s (55 s with `n_workers=0`) | about 6 min |
+| 531 basins, temporal (3 years) | about 35 s | about 1.5 h |
+
+Everything is written to `results/runs/hybrid_<split>_<timestamp>/`:
 
 | File | Contents |
 |---|---|
 | `checkpoint.pt` | final network weights, the input to inference |
+| `normalization.npz` | the feature scaling the network was trained with |
 | `checkpoints/epoch_NNNN.pt` | weights and optimizer state every 10 epochs |
 | `history.json` | per-epoch train/test NSE |
-| `test_predictions.json` | simulated streamflow and NSE for each held-out basin |
+| `test_predictions.json` | simulated streamflow and NSE for each test basin |
 | `config.yaml` | the full config the run used |
 
 Common overrides (any config value can be set this way):
 
 ```bash
-.venv/bin/python src/train.py device=cuda               # network + loss on GPU (or device=cpu)
+.venv/bin/python src/train.py device=cpu                # network + loss on CPU (default: cuda)
 .venv/bin/python src/train.py n_workers=64              # more processes for the Fortran runs
-.venv/bin/python src/train.py train.batch_size=8        # minibatches of 8 basins per gradient step
+.venv/bin/python src/train.py train.batch_size=64       # minibatches of 64 basins per gradient step
 .venv/bin/python src/train.py seed=1 train.n_epochs=50 train.lr=1e-3
 .venv/bin/python src/train.py output_dir=results/runs/my_run
-.venv/bin/python src/train.py split=temporal            # same basins, later time window
 ```
 
 For a long run on a remote machine, detach it and keep a log:
 
 ```bash
-nohup .venv/bin/python src/train.py > train.log 2>&1 &
+nohup .venv/bin/python src/train.py data=camels_531 > train.log 2>&1 &
 tail -f train.log
 ```
 
 ### 4. Run inference
 
-Point `checkpoint=` at a `checkpoint.pt` from step 3 (or at a saved
-one under `results/runs/`):
+Point `checkpoint=` at a `checkpoint.pt` from step 3, and pass the same
+`data=` you trained with:
 
 ```bash
-.venv/bin/python src/infer.py checkpoint=results/runs/hybrid_spatial_<timestamp>/checkpoint.pt
-.venv/bin/python src/infer.py checkpoint=results/runs/model_9yrs_spatial/checkpoint.pt   # saved run
+.venv/bin/python src/infer.py checkpoint=results/runs/hybrid_temporal_<timestamp>/checkpoint.pt
+.venv/bin/python src/infer.py data=camels_531 checkpoint=<path>
+.venv/bin/python src/infer.py split=spatial checkpoint=results/runs/model_9yrs_spatial/checkpoint.pt   # saved run
 ```
 
-This runs all 45 basins (train and held-out), prints the median NSE,
-and writes `predictions.json` (simulated streamflow in mm/day and NSE
-for each basin) to `results/predictions/hybrid_spatial_<timestamp>/`.
+This runs every basin in both the train and the test set, prints the
+median NSE of each, and writes `predictions.json` to
+`results/predictions/hybrid_<split>_<timestamp>/`. In that file,
+`predictions.train` and `predictions.test` map each gauge ID to its
+time window, simulated streamflow (mm/day) and NSE.
 
-It takes about 10 s: without gradients, each basin is a single
-Snow17 → SAC-SMA run. Overrides work the same way; `device=` and
-`n_workers=` work here too. To score a
-trained model on a different period without retraining, change the
-window:
+It is much faster than training: without gradients, each basin is a
+single Snow17 → SAC-SMA run (about 10 s for the 45 basins). Overrides
+work the same way; `device=` and `n_workers=` work here too. To score a
+trained model on another period, change the windows, e.g.
+`split.test_window.start=1999-10-01 split.test_window.end=2004-09-30`
+(or `split.window.*` with `split=spatial`).
+
+`model` must match what the checkpoint was trained with; the
+checkpoint stores only weights, not the architecture. `data` can be a
+different basin list (see step 5).
+
+### 5. Use your own basin list
+
+Any set of CAMELS basins works. Write their gauge IDs in a text file,
+one per line (leading zeros optional, `#` starts a comment):
+
+```text
+# my_basins.txt
+01013500
+06623800
+12145500
+```
+
+Then train on it:
 
 ```bash
-.venv/bin/python src/infer.py checkpoint=<path> split.window.start=1999-10-01 split.window.end=2004-09-30
+.venv/bin/python src/train.py data=camels_list data.basin_list=my_basins.txt
 ```
 
-The `model` and `data` settings must match the ones the checkpoint was
-trained with, which is the default unless you changed them when
-training. The checkpoint stores only weights, not the architecture.
+On the first run this:
+1. downloads CAMELS if it isn't there yet (one ~3.4 GB archive with
+   all 671 basins; CAMELS has no per-basin download),
+2. checks that every ID is a CAMELS basin,
+3. holds out 20% of the basins for testing (`data.heldout_fraction`,
+   chosen with `data.split_seed`),
+4. builds the list's attributes, climatology and PET under
+   `data/camels/datasets/my_basins/`.
+
+Later runs reuse those files, and rebuild them automatically if you
+edit the list. To check a list before training, run
+`.venv/bin/python data/prepare_dataset.py my_basins.txt`. It prints the
+basins with their names, snow fraction and train/held-out split.
+
+To choose the held-out basins yourself, use a CSV with a `split`
+column:
+
+```text
+gauge_id,split
+01013500,train
+06623800,train
+12145500,heldout
+```
+
+Things to know:
+
+- **Observations in the window.** Every basin needs observed streamflow
+  in its train and test windows. If some don't, the run stops and lists
+  them. All 671 CAMELS basins have observations in the default windows.
+- **Held-out basins.** `data.heldout_fraction` only matters for
+  `split=spatial`; with the default temporal split every basin is in
+  both sets, with different years.
+- **Inference on other basins.** Inference can use a different list
+  than training: `src/infer.py data=camels_list data.basin_list=other.txt
+  checkpoint=...`. The network's input features are scaled with the
+  training list's statistics, which training saves as
+  `normalization.npz` next to the checkpoint.
+- **Larger lists.** Time per epoch grows with the number of basins:
+  each basin costs 27 model runs per gradient step, spread across
+  `n_workers` processes. For hundreds of basins, raise `n_workers` if
+  the machine has cores to spare, and consider `train.batch_size` so
+  the network is updated more than once per epoch.
 
 ### Notes
 

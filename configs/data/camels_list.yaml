@@ -1,0 +1,23 @@
+# Any list of CAMELS basins -- the general-purpose data config.
+#
+#   .venv/bin/python src/train.py data=camels_list data.basin_list=my_basins.txt
+#
+# basin_list: a text file with one gauge ID per line, or a CSV with a
+# gauge_id column and an optional split column (train / heldout). See
+# data/prepare_dataset.py, which train.py and infer.py run automatically:
+# it downloads CAMELS if needed, checks the IDs, and builds this list's
+# attributes, climatology and PET under data/camels/datasets/<name>/,
+# rebuilding them whenever the list changes.
+basin_list: ???
+# Defaults to the list's file name without extension.
+name: ${path_stem:${data.basin_list}}
+# Used only when the list has no split column (spatial split): this
+# fraction of basins is held out, chosen with split_seed.
+heldout_fraction: 0.2
+split_seed: 0
+
+camels_dir: data/camels
+dataset_dir: data/camels/datasets/${data.name}
+selected_basins_csv: ${data.dataset_dir}/selected_basins.csv
+attributes_npz: ${data.dataset_dir}/basin_attributes.npz
+climatology_npz: ${data.dataset_dir}/basin_climatology.npz

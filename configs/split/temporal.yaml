@@ -5,10 +5,11 @@
 #
 # This is the split shape the parked full-CAMELS-671/dHBV-period
 # comparison will need later (see notes/logs.md's "Parked for later"
-# entry) -- added now so the code path exists, but the default windows
-# below are placeholders (test_window's coverage/missingness has NOT
-# been verified the way spatial.yaml's window was -- do that before
-# trusting a real run). Override both windows per experiment.
+# entry). Coverage of the default windows, checked over all 671 CAMELS
+# basins: every basin has observed streamflow in both; in the 531-basin
+# subset none has a missing day; across all 671, 2 basins miss >20% of
+# the train window and 1 has some missing days in the test window.
+# Override both windows per experiment.
 mode: temporal
 train_window:
   start: "1990-10-01"

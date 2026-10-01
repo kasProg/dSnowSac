@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "data"))
 
-from data_module import build_split, nse_value  # noqa: E402
+from data_module import apply_training_normalization, build_split, nse_value  # noqa: E402
 from model_factory import build_model, resolve_device  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
 
@@ -54,9 +54,22 @@ def run_inference(cfg: DictConfig) -> dict:
     all_ids = split.train_ids + split.test_ids
     print(f"  {len(all_examples)} basins, loaded in {time.time()-t0:.1f}s")
 
-    n_static = split.X_static[all_ids[0]].shape[0]
-    predictions: dict[str, dict] = {}
+    # Features must be scaled the way the network saw them in training,
+    # not by this basin list's own statistics -- see data_module.py.
+    norm_path = ckpt_path.parent / "normalization.npz"
+    if norm_path.exists():
+        split.X_static, split.X_climate, rescaled = apply_training_normalization(
+            cfg.data, split.X_static, split.X_climate, norm_path
+        )
+        if rescaled:
+            print("  features re-scaled to the training basin list's normalization")
+    else:
+        print(
+            f"  WARNING: no normalization.npz next to {ckpt_path.name}; using this basin "
+            "list's own feature scaling, which is only right if it is the training list"
+        )
 
+    n_static = split.X_static[all_ids[0]].shape[0]
     n_climate = split.X_climate[all_ids[0]].shape[1]
     device = resolve_device(cfg.get("device", "cpu"))
     net = build_model(cfg, n_static, n_climate)
@@ -77,25 +90,39 @@ def run_inference(cfg: DictConfig) -> dict:
     ) as pool:
         theta_A, theta_B = net(x_static, x_climate)
         sims = pool.run(theta_A, theta_B, [ex.key for ex in all_examples])
-        for ex, sim in zip(all_examples, sims):
-            predictions[ex.gauge_id] = {
+
+    # Grouped by train/test, not one dict keyed by gauge: in a temporal
+    # split every basin appears in both groups (different windows), and
+    # a flat dict let the test window silently overwrite the train one.
+    groups = {"train": split.train_examples, "test": split.test_examples}
+    predictions: dict[str, dict[str, dict]] = {name: {} for name in groups}
+    sim_by_key = {ex.key: sim for ex, sim in zip(all_examples, sims)}
+    for name, examples in groups.items():
+        for ex in examples:
+            sim = sim_by_key[ex.key]
+            predictions[name][ex.gauge_id] = {
+                "window": [str(ex.window_start.date()), str(ex.window_end.date())],
                 "sim_mm_day": sim.cpu().numpy().tolist(),
                 "nse": nse_value(sim, ex) if ex.valid_mask.any() else None,
             }
 
     # Median, not mean -- see src/train.py's matching comment; same
     # cross-basin-aggregation reasoning applies here.
-    valid_nses = [p["nse"] for p in predictions.values() if p["nse"] is not None]
-    print(f"Median NSE across {len(valid_nses)} scored basins: {np.median(valid_nses):+.4f}")
+    median_nse = {}
+    for name, preds in predictions.items():
+        valid = [p["nse"] for p in preds.values() if p["nse"] is not None]
+        median_nse[name] = float(np.median(valid)) if valid else None
+        if valid:
+            print(f"Median NSE, {name} ({len(valid)} basins): {median_nse[name]:+.4f}")
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "model": cfg.model.name,
+        "data": cfg.data.name,
         "split_mode": cfg.split.mode,
         "checkpoint": str(ckpt_path),
-        "basin_ids": all_ids,
-        "median_nse": float(np.median(valid_nses)) if valid_nses else None,
+        "median_nse": median_nse,
         "predictions": predictions,
     }
     (output_dir / "predictions.json").write_text(json.dumps(result, indent=2))

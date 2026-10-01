@@ -50,7 +50,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "data"))
 
-from data_module import BasinExample, build_split, masked_nse_loss, nse_value  # noqa: E402
+from data_module import (  # noqa: E402
+    BasinExample,
+    build_split,
+    masked_nse_loss,
+    nse_value,
+    save_normalization,
+)
 from model_factory import build_model, resolve_device  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
 
@@ -163,6 +169,9 @@ def run_training(cfg: DictConfig) -> dict:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, output_dir / "config.yaml")
+    # The feature scaling this network is trained on -- src/infer.py
+    # re-scales other basin lists to it.
+    save_normalization(cfg.data, output_dir / "normalization.npz")
     checkpoints_dir = output_dir / "checkpoints"
 
     history = []

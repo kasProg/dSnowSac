@@ -1,12 +1,15 @@
-# Top-level Hydra config for src/train.py. Defaults below reproduce
-# results/runs/model_9yrs_spatial/ exactly (model=hybrid, split=spatial,
-# seed=0) -- see results/README.md. Override any group from the CLI,
-# e.g.:
+# Top-level Hydra config for src/train.py. The default split is
+# temporal (all basins, train WY1991-1993, test WY1994-1996).
+# results/runs/model_9yrs_spatial/ is reproduced with
 #
-#   .venv/bin/python src/train.py split=temporal split.test_window.end=1998-09-30
+#   .venv/bin/python src/train.py split=spatial device=cpu
+#
+# (see results/README.md). Override any group from the CLI, e.g.:
+#
+#   .venv/bin/python src/train.py data=camels_531
 #   .venv/bin/python src/train.py seed=1 train.lr=1e-3
 #
-# See the main README's "Reproducing experiments" section.
+# See the main README's "Reproduce" section.
 defaults:
   - data: camels_snow35
   - split: temporal
@@ -17,9 +20,9 @@ defaults:
 seed: 0
 
 # Where ParamNet and the loss run: cpu, cuda, cuda:N, or auto (CUDA if
-# available). The Fortran physics always runs on CPU regardless. Default
-# cpu: the saved results/runs/ were trained on CPU, and CUDA kernels are
-# not bitwise-identical to CPU ones.
+# available). The Fortran physics always runs on CPU regardless. The
+# saved results/runs/ were trained on CPU; CUDA kernels are not
+# bitwise-identical to CPU ones, so use device=cpu to reproduce them.
 device: cuda
 
 # Worker processes for the Fortran physics (src/physics_pool.py). Each

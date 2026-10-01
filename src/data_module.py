@@ -21,13 +21,24 @@ those files' own comments for the full reasoning):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from omegaconf import OmegaConf
 
 from camels_loader import load_basin_timeseries
 from pipeline import SacSmaForcing, Snow17Forcing
+from prepare_dataset import ensure_dataset
+
+# configs/data/camels_list.yaml names a dataset after its basin list's
+# file stem: name: ${path_stem:${data.basin_list}}.
+OmegaConf.register_new_resolver("path_stem", lambda path: Path(path).stem, replace=True)
+
+
+class NoObservationsError(ValueError):
+    """A basin has no valid observed streamflow in the requested window."""
 
 # Fixed, not learnable -- Snow17's areal depletion curve. A standard
 # generic curve shape (matches what's used throughout this project's
@@ -74,10 +85,11 @@ class BasinExample:
         q_obs = ts.q_obs[mask]
         self.observed = torch.tensor(q_obs, dtype=torch.float64)
         self.valid_mask = torch.tensor(~np.isnan(q_obs))
-        assert self.valid_mask.sum() > 0, (
-            f"{gauge_id}: no valid observed days in window "
-            f"{window_start.date()}..{window_end.date()}"
-        )
+        if self.valid_mask.sum() == 0:
+            raise NoObservationsError(
+                f"{gauge_id}: no valid observed days in window "
+                f"{window_start.date()}..{window_end.date()}"
+            )
 
 
 def masked_nse_loss(sim: torch.Tensor, example: BasinExample) -> torch.Tensor:
@@ -113,6 +125,55 @@ def load_basin_features(data_cfg) -> tuple[pd.DataFrame, dict, dict]:
     return selected, X_static, X_climate
 
 
+# Attributes and climatology are z-scored over whichever basin list they
+# were built from. A network trained on list A must see list B's basins
+# scaled with A's statistics, not B's own -- otherwise the same basin
+# gets different inputs depending on what else is in the list. Training
+# saves A's statistics next to its checkpoint; inference re-scales to them.
+_NORM_KEYS = ("mean", "std", "feature_names")
+
+
+def save_normalization(data_cfg, path: Path) -> None:
+    attrs = np.load(data_cfg.attributes_npz, allow_pickle=True)
+    clim = np.load(data_cfg.climatology_npz, allow_pickle=True)
+    np.savez(
+        path,
+        **{f"static_{k}": attrs[k] for k in _NORM_KEYS},
+        **{f"climate_{k}": clim[k] for k in _NORM_KEYS},
+    )
+
+
+def apply_training_normalization(
+    data_cfg, X_static: dict, X_climate: dict, norm_path: Path
+) -> tuple[dict, dict, bool]:
+    """Re-scale features built for data_cfg's basin list to the
+    statistics saved at training time. Returns (X_static, X_climate,
+    changed); unchanged (bit-for-bit) when the statistics are identical,
+    i.e. inference on the training basin list itself."""
+    saved = np.load(norm_path, allow_pickle=True)
+    changed = False
+    out = []
+    for prefix, npz_path, X in (
+        ("static", data_cfg.attributes_npz, X_static),
+        ("climate", data_cfg.climatology_npz, X_climate),
+    ):
+        own = np.load(npz_path, allow_pickle=True)
+        if list(own["feature_names"]) != list(saved[f"{prefix}_feature_names"]):
+            raise ValueError(
+                f"{prefix} features of {npz_path} differ from the ones the checkpoint was "
+                "trained with -- the network can't take these inputs"
+            )
+        if np.array_equal(own["mean"], saved[f"{prefix}_mean"]) and np.array_equal(
+            own["std"], saved[f"{prefix}_std"]
+        ):
+            out.append(X)
+            continue
+        changed = True
+        mean, std = saved[f"{prefix}_mean"], saved[f"{prefix}_std"]
+        out.append({g: (x * own["std"] + own["mean"] - mean) / std for g, x in X.items()})
+    return out[0], out[1], changed
+
+
 @dataclass
 class SplitData:
     train_examples: list[BasinExample]
@@ -123,31 +184,51 @@ class SplitData:
     X_climate: dict
 
 
+def _build_examples(gauge_ids: list[str], start: str, end: str) -> list[BasinExample]:
+    """BasinExamples for one window, reporting every basin without
+    observations at once rather than stopping at the first."""
+    w0, w1 = pd.Timestamp(start), pd.Timestamp(end)
+    examples, no_obs = [], []
+    for g in gauge_ids:
+        try:
+            examples.append(BasinExample(g, w0, w1))
+        except NoObservationsError:
+            no_obs.append(g)
+    if no_obs:
+        raise NoObservationsError(
+            f"{len(no_obs)} basin(s) have no valid observed streamflow in "
+            f"{w0.date()}..{w1.date()}: {no_obs}. Remove them from the basin list "
+            "or choose a different window (CAMELS forcing covers 1980-2014)."
+        )
+    return examples
+
+
 def build_split(cfg) -> SplitData:
     """Dispatches on cfg.split.mode ("spatial" or "temporal") and
     returns train/test BasinExamples + basin ID lists from one code
     path. cfg needs cfg.data and cfg.split (the full composed Hydra
     config, or an equivalent manually built one -- see tests/test_train.py
-    for the non-Hydra construction used in tests)."""
+    for the non-Hydra construction used in tests).
+
+    For a data config with a basin_list (configs/data/camels_list.yaml),
+    the dataset is downloaded/built first if needed -- see
+    data/prepare_dataset.py."""
+    ensure_dataset(cfg.data)
     selected, X_static, X_climate = load_basin_features(cfg.data)
     mode = cfg.split.mode
 
     if mode == "spatial":
         train_ids = selected.loc[selected["split"] == "train", "gauge_id"].tolist()
         test_ids = selected.loc[selected["split"] == "heldout", "gauge_id"].tolist()
-        w0 = pd.Timestamp(cfg.split.window.start)
-        w1 = pd.Timestamp(cfg.split.window.end)
-        train_examples = [BasinExample(g, w0, w1) for g in train_ids]
-        test_examples = [BasinExample(g, w0, w1) for g in test_ids]
+        w = cfg.split.window
+        train_examples = _build_examples(train_ids, w.start, w.end)
+        test_examples = _build_examples(test_ids, w.start, w.end)
 
     elif mode == "temporal":
         train_ids = test_ids = selected["gauge_id"].tolist()
-        tw0 = pd.Timestamp(cfg.split.train_window.start)
-        tw1 = pd.Timestamp(cfg.split.train_window.end)
-        ew0 = pd.Timestamp(cfg.split.test_window.start)
-        ew1 = pd.Timestamp(cfg.split.test_window.end)
-        train_examples = [BasinExample(g, tw0, tw1) for g in train_ids]
-        test_examples = [BasinExample(g, ew0, ew1) for g in test_ids]
+        tw, ew = cfg.split.train_window, cfg.split.test_window
+        train_examples = _build_examples(train_ids, tw.start, tw.end)
+        test_examples = _build_examples(test_ids, ew.start, ew.end)
 
     else:
         raise ValueError(f"unknown split.mode: {mode!r} (expected 'spatial' or 'temporal')")

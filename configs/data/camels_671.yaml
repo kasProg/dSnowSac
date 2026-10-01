@@ -1,0 +1,11 @@
+# All 671 CAMELS basins -- see
+# data/basin_lists/camels_671.txt. Same mechanics as camels_list.yaml: the
+# dataset is built under data/camels/datasets/camels_671/ on first use.
+#
+#   .venv/bin/python src/train.py data=camels_671
+defaults:
+  - camels_list
+  - _self_
+
+basin_list: data/basin_lists/camels_671.txt
+name: camels_671

@@ -11,7 +11,7 @@
 # score a spatial-split checkpoint against a later date window.
 defaults:
   - data: camels_snow35
-  - split: spatial
+  - split: temporal   # same default as configs/config.yaml
   - model: hybrid
   - _self_
 

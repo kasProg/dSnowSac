@@ -21,13 +21,16 @@ from camels_loader import _load_raw_forcing, get_pet  # noqa: E402
 CAMELS_DIR = Path(__file__).resolve().parent / "camels"
 
 
-def build_pet() -> None:
-    selected = pd.read_csv(CAMELS_DIR / "selected_basins.csv", dtype={"gauge_id": str})
-    for gauge_id in selected["gauge_id"]:
+def build_pet(gauge_ids: list[str], verbose: bool = True) -> None:
+    """PET cache for any basin list (see data/prepare_dataset.py). The
+    cache is per gauge, shared across basin lists."""
+    for gauge_id in gauge_ids:
         dates, _prcp, tmax, tmin, lat, _elev, _area_km2 = _load_raw_forcing(gauge_id)
         pet = get_pet(gauge_id, dates, tmax, tmin, lat)
-        print(f"{gauge_id}: {len(pet)} days, mean PET = {pet.mean():.3f} mm/day")
+        if verbose:
+            print(f"{gauge_id}: {len(pet)} days, mean PET = {pet.mean():.3f} mm/day")
 
 
 if __name__ == "__main__":
-    build_pet()
+    selected = pd.read_csv(CAMELS_DIR / "selected_basins.csv", dtype={"gauge_id": str})
+    build_pet(selected["gauge_id"].tolist())

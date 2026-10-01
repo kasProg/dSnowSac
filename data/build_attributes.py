@@ -17,6 +17,10 @@ default for the handful of gaps within our selection.
 Writes data/camels/basin_attributes.npz: gauge_ids (45,), feature_names
 (39,), X (45, 39) z-score normalized, mean (39,), std (39,) -- the last
 two saved so a basin can be featurized identically at inference time.
+
+build_attributes(gauge_ids, out_path) works for any basin list; it is
+what data/prepare_dataset.py calls for a user-supplied list. Running
+this script directly builds the default 45-basin selection.
 """
 
 from pathlib import Path
@@ -35,8 +39,8 @@ ATTRIBUTE_FILES = [
 ]
 
 
-def build_attributes() -> None:
-    selected = pd.read_csv(CAMELS_DIR / "selected_basins.csv", dtype={"gauge_id": str})
+def build_attributes(gauge_ids: list[str], out_path: Path) -> None:
+    selected = pd.DataFrame({"gauge_id": list(gauge_ids)})
 
     full = None
     for fname in ATTRIBUTE_FILES:
@@ -62,7 +66,6 @@ def build_attributes() -> None:
     std[std == 0] = 1.0  # guard against a constant column (shouldn't occur here, but cheap)
     X_norm = (X - mean) / std
 
-    out_path = CAMELS_DIR / "basin_attributes.npz"
     np.savez(
         out_path,
         gauge_ids=subset["gauge_id"].to_numpy(),
@@ -76,4 +79,5 @@ def build_attributes() -> None:
 
 
 if __name__ == "__main__":
-    build_attributes()
+    selected = pd.read_csv(CAMELS_DIR / "selected_basins.csv", dtype={"gauge_id": str})
+    build_attributes(selected["gauge_id"].tolist(), CAMELS_DIR / "basin_attributes.npz")

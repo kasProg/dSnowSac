@@ -14,6 +14,10 @@ series would be for an LSTM trained on only 35 basins.
 
 Writes data/camels/basin_climatology.npz: gauge_ids (45,), X (45, 12, 3)
 z-score normalized (features: prcp, tmean, pet), mean (3,), std (3,).
+
+build_climatology(gauge_ids, out_path) works for any basin list (see
+data/prepare_dataset.py); running this script builds the default
+45-basin selection.
 """
 
 import sys
@@ -41,10 +45,8 @@ def monthly_climatology(gauge_id: str) -> np.ndarray:
     return monthly.to_numpy(dtype=np.float64)
 
 
-def build_climatology() -> None:
-    selected = pd.read_csv(CAMELS_DIR / "selected_basins.csv", dtype={"gauge_id": str})
-    gauge_ids = selected["gauge_id"].tolist()
-
+def build_climatology(gauge_ids: list[str], out_path: Path) -> None:
+    gauge_ids = list(gauge_ids)
     X = np.stack([monthly_climatology(gid) for gid in gauge_ids])  # (n_basins, 12, 3)
 
     mean = X.reshape(-1, 3).mean(axis=0)
@@ -52,7 +54,6 @@ def build_climatology() -> None:
     std[std == 0] = 1.0
     X_norm = (X - mean) / std
 
-    out_path = CAMELS_DIR / "basin_climatology.npz"
     np.savez(
         out_path,
         gauge_ids=np.array(gauge_ids),
@@ -63,4 +64,5 @@ def build_climatology() -> None:
 
 
 if __name__ == "__main__":
-    build_climatology()
+    selected = pd.read_csv(CAMELS_DIR / "selected_basins.csv", dtype={"gauge_id": str})
+    build_climatology(selected["gauge_id"].tolist(), CAMELS_DIR / "basin_climatology.npz")
