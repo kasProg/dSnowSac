@@ -9,12 +9,18 @@
 # See the main README's "Reproducing experiments" section.
 defaults:
   - data: camels_snow35
-  - split: spatial
+  - split: temporal
   - model: hybrid
   - train: hybrid
   - _self_
 
 seed: 0
+
+# Where ParamNet and the loss run: cpu, cuda, cuda:N, or auto (CUDA if
+# available). The Fortran physics always runs on CPU regardless. Default
+# cpu: the saved results/runs/ were trained on CPU, and CUDA kernels are
+# not bitwise-identical to CPU ones.
+device: cuda
 
 # Each run gets its own timestamped directory: saved config.yaml,
 # checkpoint.pt, history.json -- see src/train.py's run_training().

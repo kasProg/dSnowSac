@@ -12,7 +12,20 @@ comparison, see notes/logs.md) would need this same shape again.
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
+
+
+def resolve_device(name: str) -> torch.device:
+    """cfg.device -> torch.device. "auto" picks CUDA when available. Only
+    the network and loss move; the Fortran physics always runs on CPU
+    (see src/coupling.py's run_physics)."""
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"device={name!r} requested but torch.cuda.is_available() is False")
+    return device
 
 
 def build_model(cfg, n_static: int, n_climate: int) -> nn.Module:

@@ -50,7 +50,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "data"))
 
 from data_module import BasinExample, build_split, masked_nse_loss, nse_value  # noqa: E402
-from model_factory import build_model  # noqa: E402
+from model_factory import build_model, resolve_device  # noqa: E402
 from pipeline import CoupledNWSStack  # noqa: E402
 
 
@@ -63,12 +63,14 @@ def run_epoch_hybrid(
     optimizer: torch.optim.Optimizer | None,
 ) -> dict[str, float]:
     """optimizer=None -> eval mode, no gradient step. Returns
-    {gauge_id: nse}."""
+    {gauge_id: nse}. Inputs go to whatever device net lives on; the
+    physics itself always runs on CPU (src/coupling.py's run_physics)."""
+    device = next(net.parameters()).device
     x_static_batch = torch.tensor(
-        np.stack([X_static[b.gauge_id] for b in basins]), dtype=torch.float64
+        np.stack([X_static[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
     )
     x_climate_batch = torch.tensor(
-        np.stack([X_climate[b.gauge_id] for b in basins]), dtype=torch.float64
+        np.stack([X_climate[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
     )
     if optimizer is not None:
         net.train()
@@ -111,7 +113,11 @@ def run_training(cfg: DictConfig) -> dict:
 
     n_static = split.X_static[split.train_ids[0]].shape[0]
     n_climate = split.X_climate[split.train_ids[0]].shape[1]
-    net = build_model(cfg, n_static, n_climate)
+    # .get: manually built configs (tests, results/README.md snippets)
+    # predate the device key.
+    device = resolve_device(cfg.get("device", "cpu"))
+    print(f"  network + loss on {device}; Fortran physics on cpu")
+    net = build_model(cfg, n_static, n_climate).to(device)
     stack = CoupledNWSStack()
     optimizer = torch.optim.Adam(net.parameters(), lr=cfg.train.lr)
 
@@ -170,10 +176,10 @@ def run_training(cfg: DictConfig) -> dict:
     # just-trained net directly rather than reloading the checkpoint.
     net.eval()
     x_static_test = torch.tensor(
-        np.stack([split.X_static[g] for g in split.test_ids]), dtype=torch.float64
+        np.stack([split.X_static[g] for g in split.test_ids]), dtype=torch.float64, device=device
     )
     x_climate_test = torch.tensor(
-        np.stack([split.X_climate[g] for g in split.test_ids]), dtype=torch.float64
+        np.stack([split.X_climate[g] for g in split.test_ids]), dtype=torch.float64, device=device
     )
     predictions: dict[str, dict] = {}
     with torch.no_grad():
@@ -181,7 +187,7 @@ def run_training(cfg: DictConfig) -> dict:
         for i, ex in enumerate(split.test_examples):
             sim = stack.run(theta_A_test[i], theta_B_test[i], ex.snow17_forcing, ex.sacsma_forcing)
             predictions[ex.gauge_id] = {
-                "sim_mm_day": sim.numpy().tolist(),
+                "sim_mm_day": sim.cpu().numpy().tolist(),
                 "nse": nse_value(sim, ex) if ex.valid_mask.any() else None,
             }
     valid_nses = [p["nse"] for p in predictions.values() if p["nse"] is not None]

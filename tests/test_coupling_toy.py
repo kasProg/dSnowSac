@@ -187,6 +187,38 @@ def test_mixed_dtype_thetas_get_matching_gradient_dtypes(forcings, observed):
     assert torch.all(torch.isfinite(theta_B.grad))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_cuda_thetas_run_physics_on_cpu_and_match_cpu_gradients(forcings, observed):
+    """GPU training puts theta (and the loss) on CUDA, but the physics is
+    Fortran behind Tesseract and only runs on CPU. run_physics must hand
+    the physics CPU tensors, return runoff on theta's device, and land
+    each gradient on its CUDA leaf -- numerically identical to the CPU run
+    (the Jacobian is computed on CPU either way; only the J^T @ g
+    contraction moves)."""
+    base_physics = _make_physics(forcings)
+    seen_devices = set()
+
+    def physics(theta_A, theta_B):
+        seen_devices.update({theta_A.device.type, theta_B.device.type})
+        return base_physics(theta_A, theta_B)
+
+    def grads(device):
+        theta_A = torch.tensor(THETA_A0, dtype=torch.float32, device=device, requires_grad=True)
+        theta_B = torch.tensor(THETA_B0, dtype=torch.float64, device=device, requires_grad=True)
+        runoff = run_physics(physics, theta_A, theta_B)
+        assert runoff.device.type == device
+        nse_loss(runoff, observed.to(device)).backward()
+        assert theta_A.grad.device.type == device and theta_B.grad.device.type == device
+        return theta_A.grad.cpu().numpy(), theta_B.grad.cpu().numpy()
+
+    grad_A_cpu, grad_B_cpu = grads("cpu")
+    grad_A_cuda, grad_B_cuda = grads("cuda")
+
+    assert seen_devices == {"cpu"}, f"physics saw devices {seen_devices}, expected CPU only"
+    np.testing.assert_allclose(grad_A_cuda, grad_A_cpu, rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(grad_B_cuda, grad_B_cpu, rtol=1e-10, atol=1e-12)
+
+
 def test_evaluation_count_is_one_pass_per_parameter(forcings, observed):
     """Forward mode's cost is one physics evaluation per parameter
     direction (len A + len B), regardless of the RAIM series length -- the

@@ -182,13 +182,20 @@ rewriting the physics.
 
 Requires [uv](https://docs.astral.sh/uv/) and `gfortran`.
 
+### 1. Build and test
+
 ```bash
 git submodule update --init --recursive   # vendors NOAA-OWP/snow17 + sac-sma, pinned commits
 make test                                  # creates .venv, builds Fortran shims, runs pytest
 ```
 
-Multi-basin training needs CAMELS data (about 3.4 GB, downloaded once;
-`make test` does not fetch it):
+`make env` (run by `make test`) installs PyTorch's CUDA 12.6 build,
+which works with NVIDIA driver 525 or newer. For other hardware, see
+the comment at the top of the [Makefile](Makefile).
+
+### 2. Get the CAMELS data (once)
+
+About 3.4 GB. `make test` does not fetch it.
 
 ```bash
 data/download_camels.sh
@@ -196,18 +203,84 @@ data/download_camels.sh
 .venv/bin/python data/build_attributes.py
 .venv/bin/python data/build_pet.py
 .venv/bin/python data/build_climatology.py
-
-.venv/bin/python src/train.py                                  # trains the hybrid model (~2 h, CPU)
-.venv/bin/python src/infer.py checkpoint=results/runs/model_9yrs_spatial/checkpoint.pt
 ```
+
+### 3. Train
+
+```bash
+.venv/bin/python src/train.py
+```
+
+The defaults reproduce [results/runs/model_9yrs_spatial/](results/runs/model_9yrs_spatial/):
+35 training basins, 10 held-out basins, water years 1991–1999,
+150 epochs. One epoch takes about a minute on a shared 104-core
+server, so a full run takes about 2.5 hours. Use `train.n_epochs=5`
+for a quick check that everything runs. Each epoch prints a line like
+`epoch  12  train_nse=+0.41  test_nse=+0.38`, where `test_nse` is the
+median NSE on the held-out basins.
+
+Everything is written to `results/runs/hybrid_spatial_<timestamp>/`:
+
+| File | Contents |
+|---|---|
+| `checkpoint.pt` | final network weights, the input to inference |
+| `checkpoints/epoch_NNNN.pt` | weights and optimizer state every 10 epochs |
+| `history.json` | per-epoch train/test NSE |
+| `test_predictions.json` | simulated streamflow and NSE for each held-out basin |
+| `config.yaml` | the full config the run used |
+
+Common overrides (any config value can be set this way):
+
+```bash
+.venv/bin/python src/train.py device=cuda               # network + loss on GPU (default: cpu)
+.venv/bin/python src/train.py seed=1 train.n_epochs=50 train.lr=1e-3
+.venv/bin/python src/train.py output_dir=results/runs/my_run
+.venv/bin/python src/train.py split=temporal            # same basins, later time window
+```
+
+For a long run on a remote machine, detach it and keep a log:
+
+```bash
+nohup .venv/bin/python src/train.py > train.log 2>&1 &
+tail -f train.log
+```
+
+### 4. Run inference
+
+Point `checkpoint=` at a `checkpoint.pt` from step 3 (or at a saved
+one under `results/runs/`):
+
+```bash
+.venv/bin/python src/infer.py checkpoint=results/runs/hybrid_spatial_<timestamp>/checkpoint.pt
+.venv/bin/python src/infer.py checkpoint=results/runs/model_9yrs_spatial/checkpoint.pt   # saved run
+```
+
+This runs all 45 basins (train and held-out), prints the median NSE,
+and writes `predictions.json` (simulated streamflow in mm/day and NSE
+for each basin) to `results/predictions/hybrid_spatial_<timestamp>/`.
+
+Overrides work the same way. `device=cuda` works here too. To score a
+trained model on a different period without retraining, change the
+window:
+
+```bash
+.venv/bin/python src/infer.py checkpoint=<path> split.window.start=1999-10-01 split.window.end=2004-09-30
+```
+
+The `model` and `data` settings must match the ones the checkpoint was
+trained with, which is the default unless you changed them when
+training. The checkpoint stores only weights, not the architecture.
+
+### Notes
 
 Training and inference are driven by [Hydra](https://hydra.cc/)
 configs under `configs/` (data / split / model / train), not hardcoded
-constants. Override anything from the CLI, e.g. `seed=1` or
-`split.window.end=1993-09-30`. Everything runs on CPU. The bottleneck
-is the Fortran/Tesseract calls (finite-difference gradients), not
-model size, so a GPU would not help. See
-[results/README.md](results/README.md) for saved runs and
+constants. `device=cuda` (or `auto`) puts the parameter network and
+loss on a GPU; the Fortran physics always runs on CPU, and
+`src/coupling.py` moves tensors across that seam. The bottleneck is
+the Fortran/Tesseract calls (finite-difference gradients), not model
+size, so with the current small network a GPU does not speed training
+up. See [results/README.md](results/README.md) for saved runs and
 `results/compare_runs.py` for comparing them.
 
 **Docker note:** day-to-day `apply()` / `jacobian_vector_product()`
@@ -251,6 +324,7 @@ results/                              saved, seeded, reproducible run directorie
 This project started at the
 [Pasteur Labs Tesseract Hackathon 2026](https://pasteurlabs.ai/tesseract-hackathon-2026/)
 (Track 03: Hybrid ML + mechanistic models)
+Received second place rank overall 🥈
 <!-- TODO: replace the link once the announcement is live. -->
 
 ## License

@@ -78,9 +78,12 @@ class BasinExample:
 
 
 def masked_nse_loss(sim: torch.Tensor, example: BasinExample) -> torch.Tensor:
-    """1 - NSE, computed only over non-missing observed days."""
-    obs = example.observed[example.valid_mask]
-    sim_valid = sim[example.valid_mask]
+    """1 - NSE, computed only over non-missing observed days. Runs on
+    sim's device; the example's observations are kept on CPU and moved
+    per call (one series per basin -- negligible next to the physics)."""
+    mask = example.valid_mask.to(sim.device)
+    obs = example.observed.to(sim.device)[mask]
+    sim_valid = sim[mask]
     denom = torch.clamp(torch.sum((obs - obs.mean()) ** 2), min=1e-6)
     nse = 1.0 - torch.sum((obs - sim_valid) ** 2) / denom
     return 1.0 - nse

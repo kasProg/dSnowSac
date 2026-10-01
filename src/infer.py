@@ -35,7 +35,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "data"))
 
 from data_module import build_split, nse_value  # noqa: E402
-from model_factory import build_model  # noqa: E402
+from model_factory import build_model, resolve_device  # noqa: E402
 from pipeline import CoupledNWSStack  # noqa: E402
 
 
@@ -58,19 +58,24 @@ def run_inference(cfg: DictConfig) -> dict:
     predictions: dict[str, dict] = {}
 
     n_climate = split.X_climate[all_ids[0]].shape[1]
+    device = resolve_device(cfg.get("device", "cpu"))
     net = build_model(cfg, n_static, n_climate)
     net.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-    net.eval()
+    net.to(device).eval()
     stack = CoupledNWSStack()
 
-    x_static = torch.tensor(np.stack([split.X_static[g] for g in all_ids]), dtype=torch.float64)
-    x_climate = torch.tensor(np.stack([split.X_climate[g] for g in all_ids]), dtype=torch.float64)
+    x_static = torch.tensor(
+        np.stack([split.X_static[g] for g in all_ids]), dtype=torch.float64, device=device
+    )
+    x_climate = torch.tensor(
+        np.stack([split.X_climate[g] for g in all_ids]), dtype=torch.float64, device=device
+    )
     with torch.no_grad():
         theta_A, theta_B = net(x_static, x_climate)
         for i, ex in enumerate(all_examples):
             sim = stack.run(theta_A[i], theta_B[i], ex.snow17_forcing, ex.sacsma_forcing)
             predictions[ex.gauge_id] = {
-                "sim_mm_day": sim.numpy().tolist(),
+                "sim_mm_day": sim.cpu().numpy().tolist(),
                 "nse": nse_value(sim, ex) if ex.valid_mask.any() else None,
             }
 

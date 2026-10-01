@@ -1,7 +1,7 @@
-# Matches results/runs/model_9yrs_spatial/ -- ~5s/epoch (35 train + 10
-# heldout basins over the 9-year split=spatial window, each basin costs
-# ~45 real Fortran/Tesseract calls per gradient via finite differences),
-# so 150 epochs is ~13 minutes total. See main README's "Compute"
+# Matches results/runs/model_9yrs_spatial/ -- ~1 min/epoch on a shared
+# 104-core server (35 train + 10 heldout basins over the 9-year
+# split=spatial window, each basin costs ~45 real Fortran/Tesseract calls
+# per gradient via finite differences), so 150 epochs is ~2.5 hours. See main README's "Compute"
 # section before scaling n_epochs or basin count up a lot.
 n_epochs: 150
 eval_every: 3

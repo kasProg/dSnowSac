@@ -96,6 +96,61 @@ def test_training_loop_runs_and_loss_improves():
 
 
 @pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_cuda_network_gradients_match_cpu():
+    """GPU training end to end on the real Fortran stack: the same
+    ParamNet on CPU and on CUDA must produce the same loss and the same
+    network-parameter gradients for a real basin. The physics runs on CPU
+    in both cases (src/coupling.py's run_physics), so any mismatch beyond
+    float rounding means a device seam is dropping or misrouting gradient.
+    dropout=0 so both runs compute the same function (train mode stays
+    on -- cuDNN's LSTM backward refuses eval mode, and training never
+    uses it)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+
+    from data_module import build_split, masked_nse_loss
+    from paramnet import ParamNet
+    from pipeline import CoupledNWSStack
+
+    split = build_split(_spatial_cfg())
+    ex = split.train_examples[0]
+    x_s = torch.tensor(split.X_static[ex.gauge_id][None], dtype=torch.float64)
+    x_c = torch.tensor(split.X_climate[ex.gauge_id][None], dtype=torch.float64)
+
+    torch.manual_seed(0)
+    dims = dict(n_static_features=x_s.shape[1], n_climate_features=x_c.shape[2], dropout=0.0)
+    net_cpu = ParamNet(**dims)
+    net_cuda = ParamNet(**dims)
+    net_cuda.load_state_dict(net_cpu.state_dict())
+    net_cuda = net_cuda.cuda()
+    stack = CoupledNWSStack()
+
+    def loss_and_grads(net, device):
+        theta_A, theta_B = net(x_s.to(device), x_c.to(device))
+        sim = stack.run(theta_A[0], theta_B[0], ex.snow17_forcing, ex.sacsma_forcing)
+        assert sim.device.type == device
+        loss = masked_nse_loss(sim, ex)
+        loss.backward()
+        return loss.item(), {n: p.grad.cpu().numpy() for n, p in net.named_parameters()}
+
+    loss_cpu, g_cpu = loss_and_grads(net_cpu, "cpu")
+    loss_cuda, g_cuda = loss_and_grads(net_cuda, "cuda")
+
+    # Measured gap on an RTX 3090 Ti: ~1e-7 of the largest gradient. Not
+    # bit-exact (CUDA float64 kernels round differently), and theta_A is
+    # float32 + FD-differentiated, so a last-bit flip in theta could move
+    # the Snow17 Jacobian -- hence a scale-relative bound, not equality.
+    np.testing.assert_allclose(loss_cuda, loss_cpu, rtol=1e-6)
+    g_max = max(np.abs(g).max() for g in g_cpu.values())
+    assert g_max > 0, "all-zero gradients -- nothing tested"
+    for name in g_cpu:
+        gap = np.abs(g_cuda[name] - g_cpu[name]).max() / g_max
+        assert gap < 1e-5, f"{name}: CUDA vs CPU gradient gap {gap:.2e} of max |grad|"
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
 def test_build_split_spatial_matches_selected_basins_csv():
     """The config-driven split must reproduce exactly what
     data/select_basins.py wrote -- this is the thing the whole Hydra

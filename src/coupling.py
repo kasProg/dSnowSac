@@ -158,8 +158,16 @@ def run_physics(
     ordinary downstream `loss(runoff).backward()` reaches both parameter
     leaves and, above them, the network. J is computed once here regardless
     of what loss the caller applies.
+
+    Device: the physics is Fortran behind Tesseract and only ever runs on
+    CPU, so theta is moved to CPU here -- the one place the network's
+    device meets the physics -- and runoff/J are moved back to theta's
+    device below. The network, the loss and the backward contraction
+    J^T @ g all stay on whatever device theta lives on (e.g. CUDA).
     """
-    runoff_primal, J_A, J_B = _parameter_jacobian(physics, theta_A.detach(), theta_B.detach())
+    runoff_primal, J_A, J_B = _parameter_jacobian(
+        physics, theta_A.detach().cpu(), theta_B.detach().cpu()
+    )
     J_A = J_A.to(dtype=theta_A.dtype, device=theta_A.device)
     J_B = J_B.to(dtype=theta_B.dtype, device=theta_B.device)
     runoff_primal = runoff_primal.to(dtype=theta_B.dtype, device=theta_B.device)
