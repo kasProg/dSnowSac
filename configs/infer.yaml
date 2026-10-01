@@ -20,6 +20,9 @@ checkpoint: ???
 # cpu, cuda, cuda:N, or auto -- see configs/config.yaml.
 device: cpu
 
+# Worker processes for the physics -- see configs/config.yaml.
+n_workers: 32
+
 output_dir: results/predictions/${model.name}_${split.mode}_${now:%Y%m%d-%H%M%S}
 
 hydra:

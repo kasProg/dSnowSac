@@ -66,7 +66,7 @@ def test_training_loop_runs_and_loss_improves():
 
     from data_module import build_split
     from paramnet import ParamNet
-    from pipeline import CoupledNWSStack
+    from physics_pool import PhysicsPool
     from train import run_epoch_hybrid
 
     split = build_split(_spatial_cfg())
@@ -77,22 +77,69 @@ def test_training_loop_runs_and_loss_improves():
         n_static_features=split.X_static[train_basins[0].gauge_id].shape[0],
         n_climate_features=split.X_climate[train_basins[0].gauge_id].shape[1],
     )
-    stack = CoupledNWSStack()
     optimizer = torch.optim.Adam(net.parameters(), lr=3e-3)
+    forcings = {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in train_basins + heldout_basins}
 
-    nse_before = run_epoch_hybrid(net, stack, train_basins, split.X_static, split.X_climate, optimizer=None)
-    for _ in range(3):
-        run_epoch_hybrid(net, stack, train_basins, split.X_static, split.X_climate, optimizer)
-    nse_after = run_epoch_hybrid(net, stack, train_basins, split.X_static, split.X_climate, optimizer=None)
+    # n_workers=2: exercises the real multi-process path end to end.
+    with PhysicsPool(forcings, n_workers=2) as pool:
+        def epoch(basins, opt):
+            return run_epoch_hybrid(net, pool, basins, split.X_static, split.X_climate, opt)
+
+        nse_before = epoch(train_basins, None)
+        for _ in range(3):
+            epoch(train_basins, optimizer)
+        nse_after = epoch(train_basins, None)
+        heldout_nses = epoch(heldout_basins, None)
 
     mean_before = np.mean(list(nse_before.values()))
     mean_after = np.mean(list(nse_after.values()))
     assert mean_after > mean_before, (
         f"mean train NSE did not improve over 3 epochs: {mean_before:.4f} -> {mean_after:.4f}"
     )
-
-    heldout_nses = run_epoch_hybrid(net, stack, heldout_basins, split.X_static, split.X_climate, optimizer=None)
     assert all(np.isfinite(v) for v in heldout_nses.values())
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_minibatching_steps_once_per_minibatch_and_covers_every_basin():
+    """batch_size=2 over 3 basins: two optimizer steps (2 + 1 basins),
+    every basin scored exactly once, and a different order on the next
+    epoch (the rng reshuffles)."""
+    import torch
+
+    from data_module import build_split
+    from paramnet import ParamNet
+    from physics_pool import PhysicsPool
+    from train import run_epoch_hybrid
+
+    split = build_split(_spatial_cfg())
+    basins = split.train_examples[:3]
+    net = ParamNet(
+        n_static_features=split.X_static[basins[0].gauge_id].shape[0],
+        n_climate_features=split.X_climate[basins[0].gauge_id].shape[1],
+    )
+    optimizer = torch.optim.Adam(net.parameters(), lr=3e-3)
+    steps, batches = [], []
+    real_step = optimizer.step
+    optimizer.step = lambda *a, **k: (steps.append(1), real_step(*a, **k))[1]
+
+    forcings = {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in basins}
+    with PhysicsPool(forcings, n_workers=0) as pool:
+        real_run = pool.run
+        pool.run = lambda tA, tB, keys: (batches.append(list(keys)), real_run(tA, tB, keys))[1]
+        rng = np.random.default_rng(0)
+        orders = []
+        for _ in range(4):
+            batches.clear()
+            nses = run_epoch_hybrid(
+                net, pool, basins, split.X_static, split.X_climate, optimizer, batch_size=2, rng=rng
+            )
+            assert [len(b) for b in batches] == [2, 1]
+            assert sorted(k for b in batches for k in b) == sorted(ex.key for ex in basins)
+            assert set(nses) == {ex.gauge_id for ex in basins}
+            orders.append(tuple(k for b in batches for k in b))
+
+    assert len(steps) == 4 * 2
+    assert len(set(orders)) > 1, "minibatch order never changed across epochs"
 
 
 @pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")

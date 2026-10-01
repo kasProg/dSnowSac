@@ -12,14 +12,15 @@ Kept as a plain function (run_training(cfg)) wrapped by a thin
 regeneration snippets call run_training() directly with a manually built
 config, no Hydra compose/multirun machinery needed for that path.
 
-One gradient step per epoch, not per basin: theta_A/theta_B are computed
-for all training basins in a single batched ParamNet forward pass, then
-each basin's own (expensive, Fortran-backed) coupled Snow17 -> SAC-SMA
-run happens individually via CoupledNWSStack.run -- that part isn't
-batchable, SAC-SMA/Snow17 are single-HRU by construction -- and their
-losses are averaged into ONE scalar before a single
-.backward()/optimizer.step() call. Standard full-batch gradient descent
-over basins, not per-basin SGD.
+One gradient step per minibatch of basins (train.batch_size; null =
+all training basins, i.e. one full-batch step per epoch, the setting
+behind every saved run). theta_A/theta_B for the minibatch come from one
+batched ParamNet forward pass; the coupled Snow17 -> SAC-SMA runs are
+single-HRU by construction, so src/physics_pool.py fans each basin's 27
+forward-mode Jacobian passes out across n_workers processes. The
+minibatch's losses are averaged into ONE scalar before a single
+.backward()/optimizer.step() call. Evaluation runs only the primal
+physics (no Jacobian), one job per basin.
 
 A pure data-driven LSTM baseline (src/benchmark_lstm.py) used to live
 alongside this as a second `model=` option, quantifying what the
@@ -51,49 +52,68 @@ sys.path.insert(0, str(REPO_ROOT / "data"))
 
 from data_module import BasinExample, build_split, masked_nse_loss, nse_value  # noqa: E402
 from model_factory import build_model, resolve_device  # noqa: E402
-from pipeline import CoupledNWSStack  # noqa: E402
+from physics_pool import PhysicsPool  # noqa: E402
+
+
+def _network_inputs(basins, X_static: dict, X_climate: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
+    x_static = torch.tensor(
+        np.stack([X_static[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
+    )
+    x_climate = torch.tensor(
+        np.stack([X_climate[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
+    )
+    return x_static, x_climate
 
 
 def run_epoch_hybrid(
     net,
-    stack: CoupledNWSStack,
+    pool: PhysicsPool,
     basins: list[BasinExample],
     X_static: dict,
     X_climate: dict,
     optimizer: torch.optim.Optimizer | None,
+    batch_size: int | None = None,
+    rng: np.random.Generator | None = None,
 ) -> dict[str, float]:
-    """optimizer=None -> eval mode, no gradient step. Returns
-    {gauge_id: nse}. Inputs go to whatever device net lives on; the
-    physics itself always runs on CPU (src/coupling.py's run_physics)."""
+    """Returns {gauge_id: nse}.
+
+    optimizer=None -> eval: no gradient step, and the physics runs
+    primal-only (no Jacobian). Otherwise one optimizer step per minibatch
+    of `batch_size` basins, freshly shuffled by `rng` every call; with
+    batch_size None (or >= len(basins)) one full-batch step in the given
+    basin order. Train NSEs are each basin's NSE at the parameters before
+    its minibatch's step.
+
+    Inputs go to whatever device net lives on; the physics always runs on
+    CPU (src/coupling.py's run_physics)."""
     device = next(net.parameters()).device
-    x_static_batch = torch.tensor(
-        np.stack([X_static[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
-    )
-    x_climate_batch = torch.tensor(
-        np.stack([X_climate[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
-    )
-    if optimizer is not None:
-        net.train()
-        theta_A_batch, theta_B_batch = net(x_static_batch, x_climate_batch)
-    else:
+
+    if optimizer is None:
         net.eval()
         with torch.no_grad():
-            theta_A_batch, theta_B_batch = net(x_static_batch, x_climate_batch)
-        theta_A_batch = theta_A_batch.detach().requires_grad_(False)
-        theta_B_batch = theta_B_batch.detach().requires_grad_(False)
+            theta_A, theta_B = net(*_network_inputs(basins, X_static, X_climate, device))
+            sims = pool.run(theta_A, theta_B, [b.key for b in basins])
+        return {ex.gauge_id: nse_value(sim, ex) for ex, sim in zip(basins, sims)}
 
-    losses = []
+    net.train()
+    if batch_size is None or batch_size >= len(basins):
+        batch_size = len(basins)
+        order = np.arange(len(basins))
+    else:
+        if rng is None:
+            raise ValueError("minibatching (batch_size < number of basins) needs an rng")
+        order = rng.permutation(len(basins))
+
     nses = {}
-    for i, ex in enumerate(basins):
-        sim = stack.run(theta_A_batch[i], theta_B_batch[i], ex.snow17_forcing, ex.sacsma_forcing)
-        loss = masked_nse_loss(sim, ex)
-        losses.append(loss)
-        nses[ex.gauge_id] = nse_value(sim, ex)
+    for start in range(0, len(basins), batch_size):
+        batch = [basins[i] for i in order[start : start + batch_size]]
+        theta_A, theta_B = net(*_network_inputs(batch, X_static, X_climate, device))
+        sims = pool.run(theta_A, theta_B, [b.key for b in batch])
+        losses = [masked_nse_loss(sim, ex) for ex, sim in zip(batch, sims)]
+        nses.update({ex.gauge_id: nse_value(sim, ex) for ex, sim in zip(batch, sims)})
 
-    if optimizer is not None:
-        total_loss = torch.stack(losses).mean()
         optimizer.zero_grad()
-        total_loss.backward()
+        torch.stack(losses).mean().backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
         optimizer.step()
 
@@ -118,11 +138,27 @@ def run_training(cfg: DictConfig) -> dict:
     device = resolve_device(cfg.get("device", "cpu"))
     print(f"  network + loss on {device}; Fortran physics on cpu")
     net = build_model(cfg, n_static, n_climate).to(device)
-    stack = CoupledNWSStack()
     optimizer = torch.optim.Adam(net.parameters(), lr=cfg.train.lr)
 
+    n_workers = cfg.get("n_workers", 0)
+    batch_size = cfg.train.get("batch_size", None)
+    print(
+        f"  physics on {n_workers or 'no'} worker processes; "
+        f"batch_size={batch_size or 'all'} basins per gradient step"
+    )
+    pool = PhysicsPool(
+        {ex.key: (ex.snow17_forcing, ex.sacsma_forcing)
+         for ex in split.train_examples + split.test_examples},
+        n_workers=n_workers,
+    )
+    # Separate stream from torch's: minibatch order doesn't perturb
+    # network init or dropout draws.
+    rng = np.random.default_rng(cfg.seed)
+
     def run_epoch(basins, opt):
-        return run_epoch_hybrid(net, stack, basins, split.X_static, split.X_climate, opt)
+        return run_epoch_hybrid(
+            net, pool, basins, split.X_static, split.X_climate, opt, batch_size=batch_size, rng=rng
+        )
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -175,21 +211,18 @@ def run_training(cfg: DictConfig) -> dict:
     # src/infer.py's predictions.json, generated here from the
     # just-trained net directly rather than reloading the checkpoint.
     net.eval()
-    x_static_test = torch.tensor(
-        np.stack([split.X_static[g] for g in split.test_ids]), dtype=torch.float64, device=device
-    )
-    x_climate_test = torch.tensor(
-        np.stack([split.X_climate[g] for g in split.test_ids]), dtype=torch.float64, device=device
-    )
     predictions: dict[str, dict] = {}
     with torch.no_grad():
-        theta_A_test, theta_B_test = net(x_static_test, x_climate_test)
-        for i, ex in enumerate(split.test_examples):
-            sim = stack.run(theta_A_test[i], theta_B_test[i], ex.snow17_forcing, ex.sacsma_forcing)
+        theta_A_test, theta_B_test = net(
+            *_network_inputs(split.test_examples, split.X_static, split.X_climate, device)
+        )
+        sims = pool.run(theta_A_test, theta_B_test, [ex.key for ex in split.test_examples])
+        for ex, sim in zip(split.test_examples, sims):
             predictions[ex.gauge_id] = {
                 "sim_mm_day": sim.cpu().numpy().tolist(),
                 "nse": nse_value(sim, ex) if ex.valid_mask.any() else None,
             }
+    pool.close()
     valid_nses = [p["nse"] for p in predictions.values() if p["nse"] is not None]
     (output_dir / "test_predictions.json").write_text(json.dumps(
         {
@@ -209,6 +242,7 @@ def run_training(cfg: DictConfig) -> dict:
         "seed": cfg.seed,
         "n_epochs": cfg.train.n_epochs,
         "lr": cfg.train.lr,
+        "batch_size": batch_size,
         "n_train_basins": len(split.train_ids),
         "n_test_basins": len(split.test_ids),
         "train_basin_ids": split.train_ids,

@@ -213,9 +213,11 @@ data/download_camels.sh
 
 The defaults reproduce [results/runs/model_9yrs_spatial/](results/runs/model_9yrs_spatial/):
 35 training basins, 10 held-out basins, water years 1991–1999,
-150 epochs. One epoch takes about a minute on a shared 104-core
-server, so a full run takes about 2.5 hours. Use `train.n_epochs=5`
-for a quick check that everything runs. Each epoch prints a line like
+150 epochs. The Fortran runs are spread over `n_workers` processes
+(default 32). One epoch then takes about 2 s on a shared 104-core
+server (about 55 s with `n_workers=0`), so a full run takes under
+10 minutes. Use `train.n_epochs=5` for a quick check that everything
+runs. Each epoch prints a line like
 `epoch  12  train_nse=+0.41  test_nse=+0.38`, where `test_nse` is the
 median NSE on the held-out basins.
 
@@ -232,7 +234,9 @@ Everything is written to `results/runs/hybrid_spatial_<timestamp>/`:
 Common overrides (any config value can be set this way):
 
 ```bash
-.venv/bin/python src/train.py device=cuda               # network + loss on GPU (default: cpu)
+.venv/bin/python src/train.py device=cuda               # network + loss on GPU (or device=cpu)
+.venv/bin/python src/train.py n_workers=64              # more processes for the Fortran runs
+.venv/bin/python src/train.py train.batch_size=8        # minibatches of 8 basins per gradient step
 .venv/bin/python src/train.py seed=1 train.n_epochs=50 train.lr=1e-3
 .venv/bin/python src/train.py output_dir=results/runs/my_run
 .venv/bin/python src/train.py split=temporal            # same basins, later time window
@@ -259,7 +263,9 @@ This runs all 45 basins (train and held-out), prints the median NSE,
 and writes `predictions.json` (simulated streamflow in mm/day and NSE
 for each basin) to `results/predictions/hybrid_spatial_<timestamp>/`.
 
-Overrides work the same way. `device=cuda` works here too. To score a
+It takes about 10 s: without gradients, each basin is a single
+Snow17 → SAC-SMA run. Overrides work the same way; `device=` and
+`n_workers=` work here too. To score a
 trained model on a different period without retraining, change the
 window:
 
@@ -280,7 +286,10 @@ loss on a GPU; the Fortran physics always runs on CPU, and
 `src/coupling.py` moves tensors across that seam. The bottleneck is
 the Fortran/Tesseract calls (finite-difference gradients), not model
 size, so with the current small network a GPU does not speed training
-up. See [results/README.md](results/README.md) for saved runs and
+up. Those calls are what `n_workers` parallelizes: each basin needs 27
+independent gradient passes, and `src/physics_pool.py` spreads every
+(basin, pass) pair across worker processes. Results are identical for
+any `n_workers`. See [results/README.md](results/README.md) for saved runs and
 `results/compare_runs.py` for comparing them.
 
 **Docker note:** day-to-day `apply()` / `jacobian_vector_product()`

@@ -22,6 +22,11 @@ seed: 0
 # not bitwise-identical to CPU ones.
 device: cuda
 
+# Worker processes for the Fortran physics (src/physics_pool.py). Each
+# basin's 27 gradient passes are spread across them; 0 runs everything
+# in this process. Results are identical for any value.
+n_workers: 32
+
 # Each run gets its own timestamped directory: saved config.yaml,
 # checkpoint.pt, history.json -- see src/train.py's run_training().
 output_dir: results/runs/${model.name}_${split.mode}_${now:%Y%m%d-%H%M%S}

@@ -87,7 +87,7 @@ class CoupledNWSStack:
         self._snow17 = Tesseract.from_tesseract_api(str(SNOW17_TESSERACT_DIR / "tesseract_api.py"))
         self._sacsma = Tesseract.from_tesseract_api(str(SACSMA_TESSERACT_DIR / "tesseract_api.py"))
 
-    def _make_physics(self, snow17_forcing: Snow17Forcing, sacsma_forcing: SacSmaForcing):
+    def make_physics(self, snow17_forcing: Snow17Forcing, sacsma_forcing: SacSmaForcing):
         """Build the physics(theta_A, theta_B) -> runoff callable that
         chains the two Tesseracts through tesseract-torch. Closes over THIS
         call's forcing (not instance state) so interleaved basin runs can't
@@ -133,5 +133,5 @@ class CoupledNWSStack:
         Returns: runoff (TCI), float64 torch.Tensor, differentiable w.r.t.
         both theta_A and theta_B by forward-mode AD over the two Tesseracts
         (see src/coupling.py)."""
-        physics = self._make_physics(snow17_forcing, sacsma_forcing)
+        physics = self.make_physics(snow17_forcing, sacsma_forcing)
         return run_physics(physics, theta_A, theta_B)

@@ -54,6 +54,9 @@ class BasinExample:
         self.gauge_id = gauge_id
         self.window_start = window_start
         self.window_end = window_end
+        # Unique per basin AND window -- the temporal split has the same
+        # gauge in both groups. PhysicsPool looks forcing up by this.
+        self.key = f"{gauge_id}/{window_start.date()}/{window_end.date()}"
         self.snow17_forcing = Snow17Forcing(
             idt=24, idts=86400,
             iyr=dates.year.to_numpy().astype(np.int32),

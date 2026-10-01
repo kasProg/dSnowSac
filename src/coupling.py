@@ -58,56 +58,64 @@ import torch.autograd.forward_ad as fwAD
 Physics = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def _parameter_jacobian(
+# One forward-mode direction: which parameter block ("A" = Snow17's theta_A,
+# "B" = SAC-SMA's theta_B) and which index within it gets the unit tangent.
+Direction = tuple[str, int]
+
+
+def all_directions(n_a: int, n_b: int) -> list[Direction]:
+    """Every parameter direction, in J_A-then-J_B column order."""
+    return [("A", i) for i in range(n_a)] + [("B", j) for j in range(n_b)]
+
+
+def jacobian_columns(
     physics: Physics,
     theta_A: torch.Tensor,
     theta_B: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Runoff and its Jacobian columns w.r.t. each parameter, by
-    forward-mode AD over the physics chain.
+    directions: list[Direction],
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Runoff and its Jacobian columns for the given parameter directions,
+    by forward-mode AD over the physics chain.
 
-    One dual-level pass per parameter: seed a unit tangent on that single
+    One dual-level pass per direction: seed a unit tangent on that single
     parameter, run physics, and read runoff's output tangent -- exactly
-    d(runoff)/d(that parameter), one length-n column. len(theta_A) +
-    len(theta_B) passes total, independent of series length; the wide RAIM
+    d(runoff)/d(that parameter), one length-n column. The wide RAIM
     intermediate is only ever carried as a tangent vector between the two
     Tesseracts, never materialized as a Jacobian.
 
-    Returns (runoff_primal, J_A, J_B) with J_A of shape (n, len(theta_A))
-    and J_B of shape (n, len(theta_B)). runoff_primal is detached; the
-    caller re-attaches autograd through _PhysicsRunoff.
-    """
-    n_a, n_b = theta_A.numel(), theta_B.numel()
-    zero_A = torch.zeros_like(theta_A)
-    zero_B = torch.zeros_like(theta_B)
+    Each pass is independent of the others, which is what lets
+    src/physics_pool.py spread one basin's passes across worker processes:
+    all_directions() in one call is the full Jacobian; one direction per
+    call is one column of it. An empty `directions` runs physics once on
+    plain tensors and returns only the primal (no Jacobian, no JVP calls).
 
-    def unit(theta: torch.Tensor, i: int) -> torch.Tensor:
+    Returns (runoff_primal, columns), both detached, columns in
+    `directions` order.
+    """
+    if not directions:
+        with torch.no_grad():
+            return physics(theta_A, theta_B).detach().clone(), []
+
+    def unit(theta: torch.Tensor, i: int | None) -> torch.Tensor:
         e = torch.zeros_like(theta)
-        e[i] = 1.0
+        if i is not None:
+            e[i] = 1.0
         return e
 
-    cols_A: list[torch.Tensor] = []
-    cols_B: list[torch.Tensor] = []
+    columns: list[torch.Tensor] = []
     runoff_primal: torch.Tensor | None = None
-
-    for i in range(n_a):
+    for block, i in directions:
+        tangent_A = unit(theta_A, i if block == "A" else None)
+        tangent_B = unit(theta_B, i if block == "B" else None)
         with fwAD.dual_level():
-            runoff = physics(fwAD.make_dual(theta_A, unit(theta_A, i)), fwAD.make_dual(theta_B, zero_B))
+            runoff = physics(fwAD.make_dual(theta_A, tangent_A), fwAD.make_dual(theta_B, tangent_B))
             primal, tangent = fwAD.unpack_dual(runoff)
-            cols_A.append(tangent.detach().clone() if tangent is not None else torch.zeros_like(primal))
+            columns.append(tangent.detach().clone() if tangent is not None else torch.zeros_like(primal))
             if runoff_primal is None:
                 runoff_primal = primal.detach().clone()
 
-    for j in range(n_b):
-        with fwAD.dual_level():
-            runoff = physics(fwAD.make_dual(theta_A, zero_A), fwAD.make_dual(theta_B, unit(theta_B, j)))
-            _primal, tangent = fwAD.unpack_dual(runoff)
-            cols_B.append(tangent.detach().clone() if tangent is not None else torch.zeros_like(_primal))
-
-    assert runoff_primal is not None  # theta_A always has >= 1 parameter
-    J_A = torch.stack(cols_A, dim=1)  # (n, n_a)
-    J_B = torch.stack(cols_B, dim=1)  # (n, n_b)
-    return runoff_primal, J_A, J_B
+    assert runoff_primal is not None
+    return runoff_primal, columns
 
 
 class _PhysicsRunoff(torch.autograd.Function):
@@ -116,7 +124,7 @@ class _PhysicsRunoff(torch.autograd.Function):
     forward(theta_A, theta_B, J_A, J_B, runoff_primal) -> runoff
 
     The primal and its parameter Jacobians J_A = d(runoff)/d(theta_A),
-    J_B = d(runoff)/d(theta_B) are computed outside (by _parameter_jacobian's
+    J_B = d(runoff)/d(theta_B) are computed outside (by jacobian_columns'
     forward-mode passes) and passed in. backward() contracts the incoming
     runoff cotangent against those Jacobians -- grad_theta = J^T @ g_runoff
     -- giving each parameter leaf its gradient in its own dtype. J_A/J_B
@@ -145,6 +153,30 @@ class _PhysicsRunoff(torch.autograd.Function):
         return grad_A, grad_B, None, None, None
 
 
+def needs_jacobian(theta_A: torch.Tensor, theta_B: torch.Tensor) -> bool:
+    """Whether a caller will backpropagate into theta. When not (eval,
+    inference, anything under torch.no_grad()), only the primal is needed
+    and the len(theta_A) + len(theta_B) forward-mode passes are skipped."""
+    return torch.is_grad_enabled() and (theta_A.requires_grad or theta_B.requires_grad)
+
+
+def attach_jacobian(
+    theta_A: torch.Tensor,
+    theta_B: torch.Tensor,
+    runoff_primal: torch.Tensor,
+    J_A: torch.Tensor | None,
+    J_B: torch.Tensor | None,
+) -> torch.Tensor:
+    """Runoff on theta's device, carrying J for backward. With J_A/J_B
+    None (needs_jacobian() was False), the plain primal."""
+    runoff_primal = runoff_primal.to(dtype=theta_B.dtype, device=theta_B.device)
+    if J_A is None or J_B is None:
+        return runoff_primal
+    J_A = J_A.to(dtype=theta_A.dtype, device=theta_A.device)
+    J_B = J_B.to(dtype=theta_B.dtype, device=theta_B.device)
+    return _PhysicsRunoff.apply(theta_A, theta_B, J_A, J_B, runoff_primal)
+
+
 def run_physics(
     physics: Physics,
     theta_A: torch.Tensor,
@@ -154,21 +186,26 @@ def run_physics(
     autograd tensor differentiable w.r.t. theta_A and theta_B.
 
     Physics derivatives come from forward-mode AD over the two Tesseracts
-    (see _parameter_jacobian); the returned tensor carries them so an
+    (see jacobian_columns); the returned tensor carries them so an
     ordinary downstream `loss(runoff).backward()` reaches both parameter
     leaves and, above them, the network. J is computed once here regardless
-    of what loss the caller applies.
+    of what loss the caller applies -- and not at all when nothing will
+    backpropagate (see needs_jacobian). This is the serial, single-basin
+    path; src/physics_pool.py runs the same passes across processes.
 
     Device: the physics is Fortran behind Tesseract and only ever runs on
     CPU, so theta is moved to CPU here -- the one place the network's
     device meets the physics -- and runoff/J are moved back to theta's
-    device below. The network, the loss and the backward contraction
-    J^T @ g all stay on whatever device theta lives on (e.g. CUDA).
+    device by attach_jacobian. The network, the loss and the backward
+    contraction J^T @ g all stay on whatever device theta lives on.
     """
-    runoff_primal, J_A, J_B = _parameter_jacobian(
-        physics, theta_A.detach().cpu(), theta_B.detach().cpu()
+    n_a = theta_A.numel()
+    directions = all_directions(n_a, theta_B.numel()) if needs_jacobian(theta_A, theta_B) else []
+    runoff_primal, columns = jacobian_columns(
+        physics, theta_A.detach().cpu(), theta_B.detach().cpu(), directions
     )
-    J_A = J_A.to(dtype=theta_A.dtype, device=theta_A.device)
-    J_B = J_B.to(dtype=theta_B.dtype, device=theta_B.device)
-    runoff_primal = runoff_primal.to(dtype=theta_B.dtype, device=theta_B.device)
-    return _PhysicsRunoff.apply(theta_A, theta_B, J_A, J_B, runoff_primal)
+    if not columns:
+        return attach_jacobian(theta_A, theta_B, runoff_primal, None, None)
+    J_A = torch.stack(columns[:n_a], dim=1)  # (n, n_a)
+    J_B = torch.stack(columns[n_a:], dim=1)  # (n, n_b)
+    return attach_jacobian(theta_A, theta_B, runoff_primal, J_A, J_B)

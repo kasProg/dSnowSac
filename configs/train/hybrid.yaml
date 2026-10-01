@@ -1,11 +1,15 @@
-# Matches results/runs/model_9yrs_spatial/ -- ~1 min/epoch on a shared
-# 104-core server (35 train + 10 heldout basins over the 9-year
-# split=spatial window, each basin costs ~45 real Fortran/Tesseract calls
-# per gradient via finite differences), so 150 epochs is ~2.5 hours. See main README's "Compute"
-# section before scaling n_epochs or basin count up a lot.
+# Matches results/runs/model_9yrs_spatial/ -- 35 train + 10 heldout
+# basins over the 9-year split=spatial window; each basin costs 27
+# forward-mode passes per gradient. ~2 s/epoch with n_workers=32 on a
+# shared 104-core server (~55 s serial), so 150 epochs is ~6 minutes.
 n_epochs: 150
-eval_every: 3
+eval_every: 10
 lr: 3e-3
+# Basins per gradient step. null = all training basins, one full-batch
+# step per epoch (what every saved run used). A smaller value takes
+# several shuffled minibatch steps per epoch -- worth it once the basin
+# count grows well past what one step should average over.
+batch_size: null
 # Periodic resume-capable checkpoint (model + optimizer state), written
 # to output_dir/checkpoints/epoch_%04d.pt every N epochs and once more
 # on the final epoch regardless of N -- see src/train.py's run_training().

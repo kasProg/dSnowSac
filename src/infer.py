@@ -36,7 +36,7 @@ sys.path.insert(0, str(REPO_ROOT / "data"))
 
 from data_module import build_split, nse_value  # noqa: E402
 from model_factory import build_model, resolve_device  # noqa: E402
-from pipeline import CoupledNWSStack  # noqa: E402
+from physics_pool import PhysicsPool  # noqa: E402
 
 
 def run_inference(cfg: DictConfig) -> dict:
@@ -62,7 +62,8 @@ def run_inference(cfg: DictConfig) -> dict:
     net = build_model(cfg, n_static, n_climate)
     net.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
     net.to(device).eval()
-    stack = CoupledNWSStack()
+    n_workers = cfg.get("n_workers", 0)
+    print(f"  network on {device}; physics on {n_workers or 'no'} worker processes")
 
     x_static = torch.tensor(
         np.stack([split.X_static[g] for g in all_ids]), dtype=torch.float64, device=device
@@ -70,10 +71,13 @@ def run_inference(cfg: DictConfig) -> dict:
     x_climate = torch.tensor(
         np.stack([split.X_climate[g] for g in all_ids]), dtype=torch.float64, device=device
     )
-    with torch.no_grad():
+    # No gradients needed: one primal-only physics run per basin.
+    with torch.no_grad(), PhysicsPool(
+        {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in all_examples}, n_workers=n_workers
+    ) as pool:
         theta_A, theta_B = net(x_static, x_climate)
-        for i, ex in enumerate(all_examples):
-            sim = stack.run(theta_A[i], theta_B[i], ex.snow17_forcing, ex.sacsma_forcing)
+        sims = pool.run(theta_A, theta_B, [ex.key for ex in all_examples])
+        for ex, sim in zip(all_examples, sims):
             predictions[ex.gauge_id] = {
                 "sim_mm_day": sim.cpu().numpy().tolist(),
                 "nse": nse_value(sim, ex) if ex.valid_mask.any() else None,
