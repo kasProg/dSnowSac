@@ -391,11 +391,15 @@ fortran/                              bind(C) shims threading each model's state
 tesseracts/snow17/, tesseracts/sacsma/  the two Tesseract containers: apply() + finite-difference JVP/VJP
 src/coupling.py                       forward-mode bridge: physics differentiation -> network autograd
 src/pipeline.py                       chains the two Tesseracts (apply_tesseract) into coupling.py
+src/physics_pool.py                   runs each basin's gradient passes in parallel worker processes
 src/paramnet.py                       LSTM + MLP: attributes/climatology -> 27 bounded parameters
 src/train.py, src/infer.py            Hydra-driven training / checkpoint scoring CLIs
 configs/                              Hydra config groups (data/split/model/train)
 data/                                 CAMELS download + basin selection + attribute/PET/climatology prep
-tests/                                shim determinism/mass-balance, JVP/VJP checks, coupled-chain regression
+data/prepare_dataset.py               any CAMELS basin list -> training dataset (run automatically)
+data/basin_lists/                     the 531-basin benchmark subset and all 671 CAMELS basins
+tests/                                shim determinism/mass-balance, JVP/VJP checks, coupled-chain regression,
+                                      parallel-vs-serial equality, CPU/GPU gradient agreement, dataset prep
 notes/NOTES.md                        upstream Fortran findings, with a before/after proof
 notes/logs.md                         design-decision rationale log
 results/                              saved, seeded, reproducible run directories + external comparisons
@@ -417,9 +421,8 @@ results/                              saved, seeded, reproducible run directorie
 
 This project started at the
 [Pasteur Labs Tesseract Hackathon 2026](https://pasteurlabs.ai/tesseract-hackathon-2026/)
-(Track 03: Hybrid ML + mechanistic models)
-Received second place rank overall 🥈
-<!-- TODO: replace the link once the announcement is live. -->
+(Track 03: Hybrid ML + mechanistic models), where it won
+[Second Prize](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/blog/2026-09-30-tesseract-hackathon-winners/) 🥈.
 
 ## License
 
