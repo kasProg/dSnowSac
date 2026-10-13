@@ -189,7 +189,11 @@ def get_pet(gauge_id: str, dates: pd.Series, tmax: np.ndarray, tmin: np.ndarray,
     return pet
 
 
-def load_basin_timeseries(gauge_id: str) -> BasinTimeseries:
+def load_basin_timeseries(gauge_id: str, all_forcing_days: bool = False) -> BasinTimeseries:
+    """all_forcing_days=False: only days with both forcing and a
+    streamflow record. True: every forcing day, q_obs NaN where the
+    streamflow record has none -- a model run (e.g. a warmup before the
+    gauge's record starts) needs contiguous forcing, not streamflow."""
     dates, prcp, tmax, tmin, lat, elev, area_km2 = _load_raw_forcing(gauge_id)
     tmean = (tmax + tmin) / 2.0
     pet = get_pet(gauge_id, dates, tmax, tmin, lat)
@@ -211,7 +215,8 @@ def load_basin_timeseries(gauge_id: str) -> BasinTimeseries:
         "tmean": tmean, "pet": pet,
     })
     flow_df = pd.DataFrame({"date": flow_dates, "q_obs": q_mm_day})
-    merged = forcing_df.merge(flow_df, on="date", how="inner").sort_values("date")
+    how = "left" if all_forcing_days else "inner"
+    merged = forcing_df.merge(flow_df, on="date", how=how).sort_values("date")
 
     return BasinTimeseries(
         dates=pd.DatetimeIndex(merged["date"]),

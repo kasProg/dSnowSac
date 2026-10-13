@@ -68,7 +68,9 @@ class BasinExample:
     def __init__(
         self, gauge_id: str, window_start: pd.Timestamp, window_end: pd.Timestamp, warmup: int = 0
     ):
-        ts = load_basin_timeseries(gauge_id)
+        # Every forcing day: a warmup may reach back before the gauge's
+        # streamflow record starts (missing flow -> NaN, never scored).
+        ts = load_basin_timeseries(gauge_id, all_forcing_days=True)
         run_start = window_start - pd.Timedelta(days=warmup)
         run_mask = (ts.dates >= run_start) & (ts.dates <= window_end)
         mask = (ts.dates >= window_start) & (ts.dates <= window_end)

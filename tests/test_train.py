@@ -394,3 +394,17 @@ def test_eval_warmup_spins_up_on_the_training_period():
         masked_nse_loss(sim[warmup:], test_ex)
 
     assert build_split(cfg, warm_train=True).train_examples[0].warmup == warmup
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_eval_warmup_reaches_before_the_streamflow_record():
+    """02427250's streamflow record starts 1989-10-01, but its forcing
+    goes back to 1980: a 365-day warmup before that date must run on the
+    forcing (it needs no streamflow), not fail for lack of flow days."""
+    import pandas as pd
+
+    from data_module import BasinExample
+
+    ex = BasinExample("02427250", pd.Timestamp("1989-10-01"), pd.Timestamp("1990-09-30"), warmup=365)
+    assert len(ex.snow17_forcing.pcp) == 365 + 365
+    assert len(ex.valid_mask) == 365 and bool(ex.valid_mask[0])
