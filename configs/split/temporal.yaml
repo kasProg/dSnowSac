@@ -5,11 +5,15 @@
 #
 # This is the split shape the parked full-CAMELS-671/dHBV-period
 # comparison will need later (see notes/logs.md's "Parked for later"
-# entry). Coverage of the default windows, checked over all 671 CAMELS
-# basins: every basin has observed streamflow in both; in the 531-basin
-# subset none has a missing day; across all 671, 2 basins miss >20% of
-# the train window and 1 has some missing days in the test window.
-# Override both windows per experiment.
+# entry). Coverage of the default windows (train WY2000-2008, test
+# WY1990-1999), checked over all 671 CAMELS basins: every basin has
+# observed streamflow in both; in the 531-basin subset none has a
+# missing day; across all 671, 3 basins miss days of the train window
+# (1 of them >20%) and 3 miss days of the test window (at most 10%).
+# The test window comes first, so its eval_warmup (configs/config.yaml)
+# spins up on WY1989 forcing -- present for every basin, including the
+# 6 whose streamflow record starts later. Override both windows per
+# experiment.
 mode: temporal
 train_window:
   start: "1999-10-01"

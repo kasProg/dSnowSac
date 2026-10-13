@@ -1,17 +1,19 @@
-# Top-level Hydra config for src/train.py. The default split is
-# temporal (all basins, train WY1991-1993, test WY1994-1996).
+# Top-level Hydra config for src/train.py. Defaults: the 531-basin
+# CAMELS subset, temporal split (train WY2000-2008, test WY1990-1999),
+# 365-day time-window minibatches (configs/train/hybrid.yaml).
 # results/runs/model_9yrs_spatial/ is reproduced with
 #
-#   .venv/bin/python src/train.py split=spatial device=cpu
+#   .venv/bin/python src/train.py data=camels_snow35 split=spatial device=cpu train.rho=null
+#       train.batch_size=null train.n_epochs=150 eval_warmup=0
 #
 # (see results/README.md). Override any group from the CLI, e.g.:
 #
-#   .venv/bin/python src/train.py data=camels_531
+#   .venv/bin/python src/train.py data=camels_671
 #   .venv/bin/python src/train.py seed=1 train.lr=1e-3
 #
 # See the main README's "Reproduce" section.
 defaults:
-  - data: camels_snow35
+  - data: camels_531
   - split: temporal
   - model: hybrid
   - train: hybrid

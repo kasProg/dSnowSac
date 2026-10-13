@@ -18,11 +18,12 @@ results/runs/<name>/
                           # (not committed -- see .gitignore)
 ```
 
-> **Scored from a cold start.** Every run below was evaluated with the
-> physics starting cold on the first test day. Training and inference
-> now spin up for `eval_warmup` (default 365) days first; add
-> `eval_warmup=0` to the commands below to reproduce the recorded test
-> NSE.
+> **Not the current defaults.** Every run below used the 45-basin
+> spatial split, full windows and full batches, and was scored with the
+> physics starting cold on the first test day. The defaults have since
+> moved (531 basins, temporal split, 365-day time-window minibatches,
+> 365-day evaluation warmup); the commands below spell out every
+> override needed to reproduce these runs.
 
 ## `runs/model_9yrs_spatial/` -- primary result
 
@@ -39,8 +40,7 @@ Snow17 + SAC-SMA + `ParamNet` (LSTM climatology encoder + static
 attributes -> 27 bounded physical parameters), trained end-to-end
 through both Tesseracts via `src/coupling.py`. 35 train / 10 heldout
 basins (`split=spatial`), WY1991-1999 (9-year) window, 150 epochs,
-~13 minutes total under the previous coupling. This is `configs/`'s
-current default.
+~13 minutes total under the previous coupling.
 
 | epoch | median train NSE | median test (heldout) NSE |
 |---|---|---|
@@ -58,7 +58,8 @@ The same config and seed as the run above, retrained from scratch with
 the current forward-mode coupling:
 
 ```bash
-.venv/bin/python src/train.py output_dir=results/runs/model_9yrs_spatial_fwdmode
+.venv/bin/python src/train.py data=camels_snow35 split=spatial device=cpu train.rho=null train.batch_size=null train.n_epochs=150 eval_warmup=0 \
+    output_dir=results/runs/model_9yrs_spatial_fwdmode
 ```
 
 | epoch | median train NSE | median test (heldout) NSE |
@@ -103,7 +104,8 @@ new run needs checking against the canonical one (e.g. after a
 coupling/gradient change, or a different seed):
 
 ```bash
-.venv/bin/python src/train.py seed=1 output_dir=results/runs/model_9yrs_spatial_seed1
+.venv/bin/python src/train.py data=camels_snow35 split=spatial device=cpu train.rho=null train.batch_size=null train.n_epochs=150 eval_warmup=0 \
+    seed=1 output_dir=results/runs/model_9yrs_spatial_seed1
 .venv/bin/python results/compare_runs.py \
     results/runs/model_9yrs_spatial \
     results/runs/model_9yrs_spatial_seed1

@@ -205,9 +205,10 @@ data/download_camels.sh
 .venv/bin/python data/build_climatology.py
 ```
 
-These build the default set: the 45 most snow-dominated CAMELS basins.
-To train on other basins, see [step 5](#5-use-your-own-basin-list); it
-downloads CAMELS by itself if needed.
+These build the 45 most snow-dominated CAMELS basins
+(`data=camels_snow35`). The default 531-basin set, and any other list
+(see [step 5](#5-use-your-own-basin-list)), is built automatically on
+first use, downloading CAMELS if needed.
 
 ### 3. Train
 
@@ -215,9 +216,11 @@ downloads CAMELS by itself if needed.
 .venv/bin/python src/train.py
 ```
 
-By default this trains on the 45 snow-dominated basins with the
-temporal split: every basin trains on water years 1991–1993 and is
-tested on 1994–1996. It runs 150 epochs. Each epoch prints a line like
+By default this trains on the 531-basin CAMELS subset with the
+temporal split: every basin trains on water years 2000–2008 and is
+tested on 1990–1999, using 365-day time-window minibatches of 100
+basins (see "Time-window minibatches" below). It runs 100 epochs. Each
+epoch prints a line like
 `epoch  12  train_nse=+0.41  test_nse=+0.38`, where `test_nse` is the
 median NSE over the test set. Use `train.n_epochs=5` for a quick check
 that everything runs.
@@ -226,24 +229,30 @@ Choose the basins with `data=` and the evaluation with `split=`:
 
 | | |
 |---|---|
-| `data=camels_snow35` | 45 most snow-dominated basins (default) |
-| `data=camels_531` | the standard 531-basin CAMELS benchmark subset |
+| `data=camels_snow35` | 45 most snow-dominated basins |
+| `data=camels_531` | the standard 531-basin CAMELS benchmark subset (default) |
 | `data=camels_671` | all 671 CAMELS basins |
 | `data=camels_list data.basin_list=<file>` | your own list ([step 5](#5-use-your-own-basin-list)) |
 | `split=temporal` | same basins, train and test on different years (default) |
 | `split=spatial` | 80% of basins train, 20% held out, same years (WY1991–1999) |
 
+The default windows are set in [configs/split/temporal.yaml](configs/split/temporal.yaml).
+
 The 531 and 671 sets are built automatically on first use (about a
 minute). The saved run [results/runs/model_9yrs_spatial/](results/runs/model_9yrs_spatial/)
-is reproduced by `src/train.py split=spatial device=cpu`.
+is reproduced by `src/train.py data=camels_snow35 split=spatial device=cpu train.rho=null train.batch_size=null train.n_epochs=150 eval_warmup=0`.
 
 How long it takes: the Fortran runs are spread over `n_workers`
 processes (default 32). On a shared 104-core server:
 
-| Data, split | Time per epoch | 150 epochs |
+| Data, split | Time per epoch | Whole run |
 |---|---|---|
-| 45 basins, spatial (9 years) | about 2 s (55 s with `n_workers=0`) | about 6 min |
-| 531 basins, temporal (3 years) | about 35 s | about 1.5 h |
+| 45 basins, spatial (9 years) | about 2 s (55 s with `n_workers=0`) | about 6 min (150 epochs) |
+| 531 basins, temporal (3 years) | about 35 s | about 1.5 h (150 epochs) |
+| 531 basins, temporal (9 years), 365-day windows, 100 basins per step (default) | about 21 min (194 steps of ~6.4 s) | about 35 h (100 epochs) |
+
+The first two rows use full windows and full batches
+(`train.rho=null train.batch_size=null`).
 
 Everything is written to `results/runs/hybrid_<split>_<timestamp>/`:
 

@@ -1,7 +1,10 @@
-# Matches results/runs/model_9yrs_spatial/ -- 35 train + 10 heldout
-# basins over the 9-year split=spatial window; each basin costs 27
-# forward-mode passes per gradient. ~2 s/epoch with n_workers=32 on a
-# shared 104-core server (~55 s serial), so 150 epochs is ~6 minutes.
+# Cost with the defaults (data=camels_531, split=temporal training on
+# WY2000-2008): 194 steps per epoch of 100 basins x one 730-day window
+# (365 warmup + 365 scored), each basin 27 forward-mode passes. Measured
+# ~6.4 s per step with n_workers=32 on a shared 104-core server, so ~21
+# min per epoch, ~35 h for 100 epochs. results/runs/model_9yrs_spatial/
+# used full windows and full batches instead: rho=null, batch_size=null,
+# n_epochs=150 (see configs/config.yaml for the full command).
 n_epochs: 100
 eval_every: 10
 lr: 3e-3
