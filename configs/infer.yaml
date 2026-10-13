@@ -17,6 +17,10 @@ defaults:
 
 checkpoint: ???
 
+# Spin-up days before each scored window, for train and test basins
+# alike -- see configs/config.yaml. 0 reproduces the saved runs' scores.
+eval_warmup: 365
+
 # cpu, cuda, cuda:N, or auto -- see configs/config.yaml.
 device: cpu
 

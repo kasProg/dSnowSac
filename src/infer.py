@@ -49,7 +49,9 @@ def run_inference(cfg: DictConfig) -> dict:
 
     print(f"Loading basins (data={cfg.data.name}, split={cfg.split.mode})...")
     t0 = time.time()
-    split = build_split(cfg)
+    # Both groups get eval_warmup days of spin-up: here train basins are
+    # scored, not trained.
+    split = build_split(cfg, warm_train=True)
     all_examples = split.train_examples + split.test_examples
     all_ids = split.train_ids + split.test_ids
     print(f"  {len(all_examples)} basins, loaded in {time.time()-t0:.1f}s")
@@ -102,7 +104,7 @@ def run_inference(cfg: DictConfig) -> dict:
             sim = sim_by_key[ex.key]
             predictions[name][ex.gauge_id] = {
                 "window": [str(ex.window_start.date()), str(ex.window_end.date())],
-                "sim_mm_day": sim.cpu().numpy().tolist(),
+                "sim_mm_day": ex.scored(sim).cpu().numpy().tolist(),
                 "nse": nse_value(sim, ex) if ex.valid_mask.any() else None,
             }
 
@@ -122,6 +124,7 @@ def run_inference(cfg: DictConfig) -> dict:
         "data": cfg.data.name,
         "split_mode": cfg.split.mode,
         "checkpoint": str(ckpt_path),
+        "eval_warmup": cfg.get("eval_warmup", 0),
         "median_nse": median_nse,
         "predictions": predictions,
     }

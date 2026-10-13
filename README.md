@@ -262,6 +262,7 @@ Common overrides (any config value can be set this way):
 .venv/bin/python src/train.py device=cpu                # network + loss on CPU (default: cuda)
 .venv/bin/python src/train.py n_workers=64              # more processes for the Fortran runs
 .venv/bin/python src/train.py train.batch_size=64       # minibatches of 64 basins per gradient step
+.venv/bin/python src/train.py train.rho=365 train.batch_size=64   # random 365-day windows (after 365 warmup days) per step
 .venv/bin/python src/train.py seed=1 train.n_epochs=50 train.lr=1e-3
 .venv/bin/python src/train.py output_dir=results/runs/my_run
 ```
@@ -361,6 +362,21 @@ Things to know:
   `n_workers` processes. For hundreds of basins, raise `n_workers` if
   the machine has cores to spare, and consider `train.batch_size` so
   the network is updated more than once per epoch.
+- **Time-window minibatches.** With `train.rho=365`, each step trains on
+  `train.batch_size` random basins, each on a random 365-day window of
+  its training period, run from a cold start after `train.warmup`
+  (default 365) unscored spin-up days, as in HydroDL. The loss divides
+  the window's squared error by the basin's whole-period streamflow
+  variance, so a dry year does not dominate. An epoch is enough steps to
+  score each basin-day with about 99% probability
+  (`train.iters_per_epoch` overrides).
+- **Evaluation warmup.** Test windows are scored after `eval_warmup`
+  (default 365) days of spin-up on the forcing just before them (the
+  end of the training period when a temporal test window directly
+  follows it). Only forcing is used from those days, never
+  observations. `src/infer.py` does the same for train windows. The
+  saved runs in `results/runs/` were scored from a cold start; pass
+  `eval_warmup=0` to reproduce their numbers.
 
 ### Notes
 

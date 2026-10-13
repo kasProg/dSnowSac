@@ -242,3 +242,155 @@ def test_build_split_temporal_uses_same_basins_different_windows():
     for train_ex, test_ex in zip(split.train_examples[:3], split.test_examples[:3]):
         assert train_ex.gauge_id == test_ex.gauge_id
         assert train_ex.window_start != test_ex.window_start
+
+
+def test_iterations_per_epoch():
+    from train import iterations_per_epoch
+
+    # Each step scores the whole (basin, day) space: one step is enough.
+    assert iterations_per_epoch(n_basins=10, batch_size=10, n_days=730, warmup=365, rho=365) == 1
+    # Half of it per step: (1/2)^n <= 0.01 -> n = 7.
+    assert iterations_per_epoch(n_basins=10, batch_size=10, n_days=1095, warmup=365, rho=365) == 7
+    # Fewer basins per step -> more steps.
+    assert iterations_per_epoch(10, 5, 1095, 365, 365) > 7
+
+
+def test_window_starts_require_a_scored_observation():
+    from types import SimpleNamespace
+
+    import torch
+
+    from data_module import window_starts
+
+    # 20 days, observations only on days 12 and 13.
+    valid = torch.zeros(20, dtype=torch.bool)
+    valid[[12, 13]] = True
+    ex = SimpleNamespace(valid_mask=valid)
+    # warmup 3 + rho 5: start s scores days [s+3, s+8); last start is 12.
+    starts = window_starts(ex, warmup=3, rho=5)
+    assert starts.tolist() == [5, 6, 7, 8, 9, 10]
+    assert window_starts(ex, warmup=15, rho=6).size == 0  # longer than the series
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_window_loss_on_full_window_equals_nse_loss():
+    """With no warmup and the whole window, the time-window loss must be
+    exactly the full-window 1 - NSE -- the normalization is the same
+    quantity, only computed once up front."""
+    import torch
+
+    from data_module import build_split, masked_nse_loss, window_nse_loss
+
+    split = build_split(_spatial_cfg())
+    ex = split.train_examples[0]
+    sim = ex.observed.nan_to_num(0.0) * 0.8 + 0.3
+    torch.testing.assert_close(window_nse_loss(sim, ex, 0, 0), masked_nse_loss(sim, ex), rtol=1e-12, atol=0)
+
+    # Offset window with warmup, against an independent numpy recomputation:
+    # sim covers days [100, 300); days [150, 300) are scored.
+    obs = ex.observed.numpy()
+    full = obs[~np.isnan(obs)]
+    expected = np.nanmean((obs[150:300] - sim[150:300].numpy()) ** 2) / np.mean((full - full.mean()) ** 2)
+    np.testing.assert_allclose(window_nse_loss(sim[100:300], ex, 100, 50).item(), expected, rtol=1e-10)
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_window_epoch_samples_valid_windows_and_steps_per_iteration():
+    """run_epoch_windows: n_iters optimizer steps, batch_size distinct
+    basins each, every window warmup + rho days long and starting at an
+    allowed start, one train NSE per sampled window."""
+    import torch
+
+    from data_module import build_split, window_starts
+    from paramnet import ParamNet
+    from physics_pool import PhysicsPool
+    from train import run_epoch_windows
+
+    split = build_split(_spatial_cfg())
+    basins = split.train_examples[:3]
+    warmup, rho = 30, 60
+    starts = {ex.key: window_starts(ex, warmup, rho) for ex in basins}
+    net = ParamNet(
+        n_static_features=split.X_static[basins[0].gauge_id].shape[0],
+        n_climate_features=split.X_climate[basins[0].gauge_id].shape[1],
+    )
+    optimizer = torch.optim.Adam(net.parameters(), lr=3e-3)
+    steps, calls = [], []
+    real_step = optimizer.step
+    optimizer.step = lambda *a, **k: (steps.append(1), real_step(*a, **k))[1]
+
+    forcings = {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in basins}
+    with PhysicsPool(forcings, n_workers=2) as pool:
+        real_run = pool.run
+
+        def recording_run(tA, tB, keys, windows):
+            sims = real_run(tA, tB, keys, windows)
+            calls.append((list(keys), list(windows), [s.shape[0] for s in sims]))
+            return sims
+
+        pool.run = recording_run
+        nses = run_epoch_windows(
+            net, pool, basins, split.X_static, split.X_climate, optimizer, starts,
+            batch_size=2, warmup=warmup, rho=rho, n_iters=3, rng=np.random.default_rng(0),
+        )
+
+    assert len(steps) == 3 and len(calls) == 3 and len(nses) == 6
+    assert all(np.isfinite(nses))
+    for keys, windows, lengths in calls:
+        assert len(set(keys)) == 2
+        assert lengths == [warmup + rho] * 2
+        for key, (t0, t1) in zip(keys, windows):
+            assert t0 in starts[key] and t1 - t0 == warmup + rho
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_eval_warmup_spins_up_on_the_training_period():
+    """Temporal split, test window right after the train window: each test
+    example's forcing must be the last `warmup` days of its train
+    example's forcing followed by the test window's own forcing, while
+    observations (and so scores) cover the test window only. Train
+    examples stay un-warmed unless asked for."""
+    import torch
+
+    from data_module import build_split, masked_nse_loss
+
+    warmup = 100
+    cfg = OmegaConf.create({
+        "data": {
+            "name": "camels_snow35",
+            "selected_basins_csv": str(CAMELS_DIR / "selected_basins.csv"),
+            "attributes_npz": str(CAMELS_DIR / "basin_attributes.npz"),
+            "climatology_npz": str(CAMELS_DIR / "basin_climatology.npz"),
+        },
+        "split": {
+            "mode": "temporal",
+            "train_window": {"start": "1990-10-01", "end": "1991-09-30"},
+            "test_window": {"start": "1991-10-01", "end": "1992-09-30"},
+        },
+        "eval_warmup": warmup,
+    })
+    split = build_split(cfg)
+    cold = build_split(OmegaConf.merge(cfg, {"eval_warmup": 0}))
+    train_ex, test_ex, cold_test = split.train_examples[0], split.test_examples[0], cold.test_examples[0]
+
+    assert train_ex.warmup == 0 and test_ex.warmup == warmup
+    n = len(cold_test.valid_mask)
+    for name in ("pcp", "tmp", "iyr", "imn", "ida"):
+        warm = getattr(test_ex.snow17_forcing, name)
+        assert len(warm) == warmup + n
+        np.testing.assert_array_equal(warm[:warmup], getattr(train_ex.snow17_forcing, name)[-warmup:])
+        np.testing.assert_array_equal(warm[warmup:], getattr(cold_test.snow17_forcing, name))
+    for name in ("tmp", "etp"):
+        warm = getattr(test_ex.sacsma_forcing, name)
+        np.testing.assert_array_equal(warm[:warmup], getattr(train_ex.sacsma_forcing, name)[-warmup:])
+        np.testing.assert_array_equal(warm[warmup:], getattr(cold_test.sacsma_forcing, name))
+    assert torch.equal(test_ex.observed.nan_to_num(-1), cold_test.observed.nan_to_num(-1))
+    assert test_ex.key != cold_test.key
+
+    # Scoring drops exactly the warmup days, and refuses a misaligned series.
+    sim = torch.rand(warmup + n, dtype=torch.float64)
+    assert torch.equal(masked_nse_loss(sim, test_ex), masked_nse_loss(sim[warmup:], cold_test))
+    with pytest.raises(ValueError, match="expected"):
+        masked_nse_loss(sim[warmup:], test_ex)
+
+    assert build_split(cfg, warm_train=True).train_examples[0].warmup == warmup

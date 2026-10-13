@@ -55,31 +55,52 @@ class BasinExample:
     don't change during training). window_start/window_end were a fixed
     module-level pair in the pre-Hydra src/train.py; now an explicit
     argument so the same class serves both the spatial split's single
-    shared window and the temporal split's per-group windows."""
+    shared window and the temporal split's per-group windows.
 
-    def __init__(self, gauge_id: str, window_start: pd.Timestamp, window_end: pd.Timestamp):
+    warmup > 0: the forcing starts `warmup` days before window_start, so
+    the physics spins up from its cold start on the preceding forcing
+    (the end of the training period, when a test window directly
+    follows it) and the
+    window itself starts from warmed-up states. Observations and scores
+    cover the window only -- use scored() to drop the warmup days from a
+    simulation."""
+
+    def __init__(
+        self, gauge_id: str, window_start: pd.Timestamp, window_end: pd.Timestamp, warmup: int = 0
+    ):
         ts = load_basin_timeseries(gauge_id)
+        run_start = window_start - pd.Timedelta(days=warmup)
+        run_mask = (ts.dates >= run_start) & (ts.dates <= window_end)
         mask = (ts.dates >= window_start) & (ts.dates <= window_end)
-        dates = ts.dates[mask]
+        n_before = int((run_mask & (ts.dates < window_start)).sum())
+        if n_before != warmup:
+            raise ValueError(
+                f"{gauge_id}: {warmup} warmup days requested before {window_start.date()}, "
+                f"but only {n_before} days of data precede it (CAMELS starts 1980-01-01)"
+            )
+        dates = ts.dates[run_mask]
 
         self.gauge_id = gauge_id
         self.window_start = window_start
         self.window_end = window_end
-        # Unique per basin AND window -- the temporal split has the same
-        # gauge in both groups. PhysicsPool looks forcing up by this.
-        self.key = f"{gauge_id}/{window_start.date()}/{window_end.date()}"
+        self.warmup = warmup
+        # Unique per basin, window AND warmup -- the temporal split has
+        # the same gauge in both groups. PhysicsPool looks forcing up by this.
+        self.key = f"{gauge_id}/{window_start.date()}/{window_end.date()}" + (
+            f"/warmup{warmup}" if warmup else ""
+        )
         self.snow17_forcing = Snow17Forcing(
             idt=24, idts=86400,
             iyr=dates.year.to_numpy().astype(np.int32),
             imn=dates.month.to_numpy().astype(np.int32),
             ida=dates.day.to_numpy().astype(np.int32),
-            pcp=ts.prcp[mask], tmp=ts.tmean[mask],
+            pcp=ts.prcp[run_mask], tmp=ts.tmean[run_mask],
             alat=ts.lat, elev=ts.elev,
             adc=DEFAULT_ADC,
             cs0=np.zeros(19, dtype=np.float64), tprev0=0.0,
         )
         self.sacsma_forcing = SacSmaForcing(
-            dtm=86400.0, tmp=ts.tmean[mask], etp=ts.pet[mask],
+            dtm=86400.0, tmp=ts.tmean[run_mask], etp=ts.pet[run_mask],
             state0=np.zeros(6, dtype=np.float64),
         )
         q_obs = ts.q_obs[mask]
@@ -90,12 +111,30 @@ class BasinExample:
                 f"{gauge_id}: no valid observed days in window "
                 f"{window_start.date()}..{window_end.date()}"
             )
+        # Observed variance over the WHOLE window -- the fixed scale
+        # window_nse_loss normalizes every sampled sub-window by. Same
+        # clamp as masked_nse_loss, so the two agree on the full window.
+        valid = q_obs[~np.isnan(q_obs)]
+        self.obs_variance = max(float(np.sum((valid - valid.mean()) ** 2)), 1e-6) / valid.size
+
+    def scored(self, sim: torch.Tensor) -> torch.Tensor:
+        """The window part of a simulation over this example's forcing:
+        drops the warmup days, checking the length lines up exactly."""
+        n = len(self.valid_mask)
+        if sim.shape[0] != self.warmup + n:
+            raise ValueError(
+                f"{self.key}: simulation has {sim.shape[0]} days, expected "
+                f"{self.warmup} warmup + {n} window days"
+            )
+        return sim[self.warmup :]
 
 
 def masked_nse_loss(sim: torch.Tensor, example: BasinExample) -> torch.Tensor:
-    """1 - NSE, computed only over non-missing observed days. Runs on
-    sim's device; the example's observations are kept on CPU and moved
-    per call (one series per basin -- negligible next to the physics)."""
+    """1 - NSE, computed only over non-missing observed days of the
+    example's window (sim covers its warmup too; see BasinExample.scored).
+    Runs on sim's device; the example's observations are kept on CPU and
+    moved per call (one series per basin -- negligible next to the physics)."""
+    sim = example.scored(sim)
     mask = example.valid_mask.to(sim.device)
     obs = example.observed.to(sim.device)[mask]
     sim_valid = sim[mask]
@@ -107,6 +146,37 @@ def masked_nse_loss(sim: torch.Tensor, example: BasinExample) -> torch.Tensor:
 def nse_value(sim: torch.Tensor, example: BasinExample) -> float:
     with torch.no_grad():
         return float(1.0 - masked_nse_loss(sim, example).item())
+
+
+def window_nse_loss(sim: torch.Tensor, example: BasinExample, start: int, warmup: int) -> torch.Tensor:
+    """Loss for one sampled time window (src/train.py's time-window
+    minibatching). `sim` is runoff for days [start, start + len(sim)) of
+    the example's window, run from a cold start; its first `warmup` days
+    are spin-up and not scored.
+
+    Mean squared error over the scored days' valid observations, divided
+    by the observed variance of the basin's WHOLE window, not of this
+    sub-window. A per-window NSE would divide by one year's variance:
+    a flat dry year would get a tiny denominator and dominate the batch.
+    With warmup=0 and the full window this equals masked_nse_loss."""
+    # Indexes observations by forcing position: only valid without an
+    # example-level warmup prepended to the forcing.
+    assert example.warmup == 0, "time-window training needs examples built with warmup=0"
+    stop = start + sim.shape[0]
+    mask = example.valid_mask[start + warmup : stop].to(sim.device)
+    obs = example.observed[start + warmup : stop].to(sim.device)[mask]
+    sim_valid = sim[warmup:][mask]
+    return torch.mean((obs - sim_valid) ** 2) / example.obs_variance
+
+
+def window_starts(example: BasinExample, warmup: int, rho: int) -> np.ndarray:
+    """Every start index whose window -- `warmup` spin-up days then `rho`
+    scored days -- fits inside the example's series and has at least one
+    observed day among the scored ones (otherwise its loss is undefined)."""
+    n_valid = np.concatenate([[0], np.cumsum(example.valid_mask.numpy())])
+    starts = np.arange(len(example.valid_mask) - warmup - rho + 1)
+    scored = n_valid[starts + warmup + rho] - n_valid[starts + warmup]
+    return starts[scored > 0]
 
 
 def load_basin_features(data_cfg) -> tuple[pd.DataFrame, dict, dict]:
@@ -184,14 +254,14 @@ class SplitData:
     X_climate: dict
 
 
-def _build_examples(gauge_ids: list[str], start: str, end: str) -> list[BasinExample]:
+def _build_examples(gauge_ids: list[str], start: str, end: str, warmup: int = 0) -> list[BasinExample]:
     """BasinExamples for one window, reporting every basin without
     observations at once rather than stopping at the first."""
     w0, w1 = pd.Timestamp(start), pd.Timestamp(end)
     examples, no_obs = [], []
     for g in gauge_ids:
         try:
-            examples.append(BasinExample(g, w0, w1))
+            examples.append(BasinExample(g, w0, w1, warmup))
         except NoObservationsError:
             no_obs.append(g)
     if no_obs:
@@ -203,12 +273,17 @@ def _build_examples(gauge_ids: list[str], start: str, end: str) -> list[BasinExa
     return examples
 
 
-def build_split(cfg) -> SplitData:
+def build_split(cfg, warm_train: bool = False) -> SplitData:
     """Dispatches on cfg.split.mode ("spatial" or "temporal") and
     returns train/test BasinExamples + basin ID lists from one code
     path. cfg needs cfg.data and cfg.split (the full composed Hydra
     config, or an equivalent manually built one -- see tests/test_train.py
     for the non-Hydra construction used in tests).
+
+    cfg.eval_warmup (default 0) days of preceding forcing are prepended
+    to every test example (see BasinExample). Train examples get it only
+    with warm_train=True -- for scoring them (src/infer.py), not for
+    training, whose examples must start at their window.
 
     For a data config with a basin_list (configs/data/camels_list.yaml),
     the dataset is downloaded/built first if needed -- see
@@ -216,19 +291,21 @@ def build_split(cfg) -> SplitData:
     ensure_dataset(cfg.data)
     selected, X_static, X_climate = load_basin_features(cfg.data)
     mode = cfg.split.mode
+    test_warmup = cfg.get("eval_warmup", 0)
+    train_warmup = test_warmup if warm_train else 0
 
     if mode == "spatial":
         train_ids = selected.loc[selected["split"] == "train", "gauge_id"].tolist()
         test_ids = selected.loc[selected["split"] == "heldout", "gauge_id"].tolist()
         w = cfg.split.window
-        train_examples = _build_examples(train_ids, w.start, w.end)
-        test_examples = _build_examples(test_ids, w.start, w.end)
+        train_examples = _build_examples(train_ids, w.start, w.end, train_warmup)
+        test_examples = _build_examples(test_ids, w.start, w.end, test_warmup)
 
     elif mode == "temporal":
         train_ids = test_ids = selected["gauge_id"].tolist()
         tw, ew = cfg.split.train_window, cfg.split.test_window
-        train_examples = _build_examples(train_ids, tw.start, tw.end)
-        test_examples = _build_examples(test_ids, ew.start, ew.end)
+        train_examples = _build_examples(train_ids, tw.start, tw.end, train_warmup)
+        test_examples = _build_examples(test_ids, ew.start, ew.end, test_warmup)
 
     else:
         raise ValueError(f"unknown split.mode: {mode!r} (expected 'spatial' or 'temporal')")

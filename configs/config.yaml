@@ -19,6 +19,14 @@ defaults:
 
 seed: 0
 
+# Days of spin-up before each test window: the physics starts cold on
+# the forcing just before the window (the end of the training period
+# only when the test window directly follows it) and only the window is
+# scored. Forcing only -- no observations from the warmup period are
+# used. The saved results/runs/ were scored from a cold start: use
+# eval_warmup=0 to reproduce their test NSE.
+eval_warmup: 365
+
 # Where ParamNet and the loss run: cpu, cuda, cuda:N, or auto (CUDA if
 # available). The Fortran physics always runs on CPU regardless. The
 # saved results/runs/ were trained on CPU; CUDA kernels are not

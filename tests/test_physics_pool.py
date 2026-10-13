@@ -105,3 +105,29 @@ def test_unregistered_basin_key_raises(two_basins):
     tA, tB = _leaves(theta_A, theta_B)
     with PhysicsPool(forcings, n_workers=0) as pool, pytest.raises(KeyError, match="not registered"):
         pool.run(tA[:1], tB[:1], ["nope"])
+
+
+@pytest.mark.parametrize("n_workers", [0, 2])
+def test_windowed_job_matches_presliced_forcing(two_basins, n_workers):
+    """A job's [start, stop) window must run exactly the forcing it names:
+    same runoff and gradients, bitwise, as registering that slice as its
+    own basin. Two different windows in one batch so a window applied to
+    the wrong basin, or an off-by-one, changes the result."""
+    stack, forcings, theta_A, theta_B = two_basins
+    windows = [(40, 240), (100, 365)]
+    sliced = {
+        key: (sf.window(*w), cf.window(*w))
+        for (key, (sf, cf)), w in zip(forcings.items(), windows)
+    }
+    ref_sims, ref_grad_A, ref_grad_B = _serial_reference(stack, sliced, theta_A, theta_B)
+
+    tA, tB = _leaves(theta_A, theta_B)
+    with PhysicsPool(forcings, n_workers=n_workers) as pool:
+        sims = pool.run(tA, tB, ["b0", "b1"], windows)
+    _loss(sims).backward()
+
+    assert [s.shape[0] for s in sims] == [200, 265]
+    for sim, ref in zip(sims, ref_sims):
+        assert torch.equal(sim.detach(), ref)
+    assert torch.equal(tA.grad, ref_grad_A)
+    assert torch.equal(tB.grad, ref_grad_B)

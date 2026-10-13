@@ -10,6 +10,19 @@ lr: 3e-3
 # several shuffled minibatch steps per epoch -- worth it once the basin
 # count grows well past what one step should average over.
 batch_size: null
+# Time-window minibatching (HydroDL-style). null = every step runs each
+# basin's full training window (what every saved run used). Set to e.g.
+# 365: each step draws batch_size distinct random basins (null = all) and
+# a random window per basin -- `warmup` spin-up days from a cold start,
+# then `rho` days the loss scores, normalized by the basin's whole
+# training-window variance (src/data_module.py's window_nse_loss). The
+# training window must hold at least warmup + rho days. median_train_nse
+# is then the median over every window sampled in the epoch.
+rho: null
+warmup: 365
+# Steps per epoch when rho is set. null = enough that each (basin, day)
+# is scored with ~99% probability (src/train.py's iterations_per_epoch).
+iters_per_epoch: null
 # Periodic resume-capable checkpoint (model + optimizer state), written
 # to output_dir/checkpoints/epoch_%04d.pt every N epochs and once more
 # on the final epoch regardless of N -- see src/train.py's run_training().

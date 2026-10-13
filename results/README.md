@@ -18,6 +18,12 @@ results/runs/<name>/
                           # (not committed -- see .gitignore)
 ```
 
+> **Scored from a cold start.** Every run below was evaluated with the
+> physics starting cold on the first test day. Training and inference
+> now spin up for `eval_warmup` (default 365) days first; add
+> `eval_warmup=0` to the commands below to reproduce the recorded test
+> NSE.
+
 ## `runs/model_9yrs_spatial/` -- primary result
 
 > **Trained under the previous coupling.** This run used the earlier

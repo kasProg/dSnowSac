@@ -22,6 +22,11 @@ tests/test_physics_pool.py).
 When nothing will backpropagate (eval, inference, torch.no_grad()), each
 basin is one primal-only job instead of 27 Jacobian passes.
 
+A job may name a time window [start, stop) into its basin's registered
+forcing (src/train.py's time-window minibatching): the worker slices the
+forcing it already holds and runs that window from the forcing's initial
+state, so sampling windows never re-ships forcing.
+
 Forcing for every basin is shipped to each worker once, at pool start,
 keyed by a string (BasinExample.key); a job then names its basin by key
 instead of re-pickling ~3,000-day forcing series for every pass. It is
@@ -54,8 +59,10 @@ from coupling import Direction, all_directions, attach_jacobian, jacobian_column
 from pipeline import CoupledNWSStack, SacSmaForcing, Snow17Forcing
 
 Forcings = dict[str, tuple[Snow17Forcing, SacSmaForcing]]
-# (basin key, theta_A, theta_B, directions) -- directions empty = primal only.
-_Job = tuple[str, np.ndarray, np.ndarray, list[Direction]]
+# [start, stop) day indices into a basin's registered forcing; None = all of it.
+Window = tuple[int, int] | None
+# (basin key, window, theta_A, theta_B, directions) -- directions empty = primal only.
+_Job = tuple[str, Window, np.ndarray, np.ndarray, list[Direction]]
 
 # Per-worker state, set once by _init_worker.
 _WORKER_STACK: CoupledNWSStack | None = None
@@ -66,8 +73,10 @@ _STARTUP_TIMEOUT_S = 600
 
 
 def _run_job(stack: CoupledNWSStack, forcings: Forcings, job: _Job):
-    key, theta_A, theta_B, directions = job
+    key, window, theta_A, theta_B, directions = job
     snow17_forcing, sacsma_forcing = forcings[key]
+    if window is not None:
+        snow17_forcing, sacsma_forcing = snow17_forcing.window(*window), sacsma_forcing.window(*window)
     physics = stack.make_physics(snow17_forcing, sacsma_forcing)
     primal, columns = jacobian_columns(
         physics, torch.from_numpy(theta_A), torch.from_numpy(theta_B), directions
@@ -99,7 +108,7 @@ def _worker_job(job: _Job):
 
 
 class PhysicsPool:
-    """`run(theta_A_batch, theta_B_batch, keys) -> [runoff per basin]`.
+    """`run(theta_A_batch, theta_B_batch, keys, windows=None) -> [runoff per basin]`.
 
     n_workers=0 runs every job in this process (no subprocesses) through
     the same job function -- the reference path for tests and small runs.
@@ -130,12 +139,17 @@ class PhysicsPool:
         theta_A_batch: torch.Tensor,
         theta_B_batch: torch.Tensor,
         keys: list[str],
+        windows: list[Window] | None = None,
     ) -> list[torch.Tensor]:
         """theta_A_batch: (B, 11), theta_B_batch: (B, 16), keys: B basin
-        keys registered at construction. Returns B runoff tensors on the
-        thetas' device, each differentiable w.r.t. its own row of the
-        batch (unless needs_jacobian() is False -- then plain primals)."""
-        assert theta_A_batch.shape[0] == theta_B_batch.shape[0] == len(keys)
+        keys registered at construction, windows: B [start, stop) day
+        ranges into each basin's forcing (None = full series). Returns B
+        runoff tensors on the thetas' device, each differentiable w.r.t.
+        its own row of the batch (unless needs_jacobian() is False -- then
+        plain primals)."""
+        if windows is None:
+            windows = [None] * len(keys)
+        assert theta_A_batch.shape[0] == theta_B_batch.shape[0] == len(keys) == len(windows)
         missing = [k for k in keys if k not in self._forcings]
         if missing:
             raise KeyError(f"basins not registered with this PhysicsPool: {missing}")
@@ -149,7 +163,9 @@ class PhysicsPool:
         # when no Jacobian is needed.
         per_basin = [[d] for d in directions] or [[]]
         jobs: list[_Job] = [
-            (key, theta_A_np[b], theta_B_np[b], dirs) for b, key in enumerate(keys) for dirs in per_basin
+            (key, window, theta_A_np[b], theta_B_np[b], dirs)
+            for b, (key, window) in enumerate(zip(keys, windows))
+            for dirs in per_basin
         ]
         if self._executor is not None:
             results = list(self._executor.map(_worker_job, jobs))

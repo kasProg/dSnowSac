@@ -18,7 +18,7 @@ the natural fit (few parameters, one wide intermediate flux, scalar loss).
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +63,14 @@ class Snow17Forcing:
     cs0: np.ndarray
     tprev0: float
 
+    def window(self, start: int, stop: int) -> Snow17Forcing:
+        """Days [start, stop) of the series, starting from this forcing's
+        own initial state (cs0/tprev0) -- a cold start when that is zero."""
+        return replace(
+            self, iyr=self.iyr[start:stop], imn=self.imn[start:stop], ida=self.ida[start:stop],
+            pcp=self.pcp[start:stop], tmp=self.tmp[start:stop],
+        )
+
 
 @dataclass
 class SacSmaForcing:
@@ -73,6 +81,10 @@ class SacSmaForcing:
     tmp: np.ndarray
     etp: np.ndarray
     state0: np.ndarray
+
+    def window(self, start: int, stop: int) -> SacSmaForcing:
+        """Days [start, stop), from this forcing's own state0."""
+        return replace(self, tmp=self.tmp[start:stop], etp=self.etp[start:stop])
 
 
 class CoupledNWSStack:

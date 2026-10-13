@@ -22,6 +22,16 @@ minibatch's losses are averaged into ONE scalar before a single
 .backward()/optimizer.step() call. Evaluation runs only the primal
 physics (no Jacobian), one job per basin.
 
+Time-window minibatching (train.rho set, HydroDL-style): instead of
+each basin's full training window, every step samples batch_size basins
+and, for each, a random window of train.warmup + train.rho days inside
+its training window. The physics runs that window from a cold start and
+the loss scores only the last rho days (data_module.window_nse_loss). An
+epoch is iterations_per_epoch() such steps.
+
+Evaluation scores the full test window, after eval_warmup days of
+spin-up on the forcing just before it (data_module.BasinExample).
+
 A pure data-driven LSTM baseline (src/benchmark_lstm.py) used to live
 alongside this as a second `model=` option, quantifying what the
 physical constraint bought relative to a black-box model trained on the
@@ -56,6 +66,8 @@ from data_module import (  # noqa: E402
     masked_nse_loss,
     nse_value,
     save_normalization,
+    window_nse_loss,
+    window_starts,
 )
 from model_factory import build_model, resolve_device  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
@@ -126,6 +138,61 @@ def run_epoch_hybrid(
     return nses
 
 
+def iterations_per_epoch(n_basins: int, batch_size: int, n_days: int, warmup: int, rho: int) -> int:
+    """Gradient steps per epoch of time-window minibatching: enough that
+    any given (basin, scorable day) lands in at least one sampled window
+    with ~99% probability. One step scores batch_size * rho of the
+    n_basins * (n_days - warmup) scorable (basin, day) pairs, a fraction
+    p; n steps miss a given pair with probability ~(1 - p)^n <= 0.01."""
+    p = batch_size * rho / (n_basins * (n_days - warmup))
+    if p >= 1.0:
+        return 1
+    return int(np.ceil(np.log(0.01) / np.log(1.0 - p)))
+
+
+def run_epoch_windows(
+    net,
+    pool: PhysicsPool,
+    basins: list[BasinExample],
+    X_static: dict,
+    X_climate: dict,
+    optimizer: torch.optim.Optimizer,
+    starts: dict[str, np.ndarray],
+    *,
+    batch_size: int | None,
+    warmup: int,
+    rho: int,
+    n_iters: int,
+    rng: np.random.Generator,
+) -> list[float]:
+    """n_iters gradient steps, each on batch_size distinct basins drawn
+    at random, each basin on a random window [s, s + warmup + rho) with s
+    drawn from starts[basin.key] (data_module.window_starts). Returns
+    1 - window loss for every sampled window, at the parameters before
+    its step -- an NSE normalized by the basin's whole-window variance."""
+    device = next(net.parameters()).device
+    net.train()
+    batch_size = min(batch_size or len(basins), len(basins))
+
+    nses = []
+    for _ in range(n_iters):
+        batch = [basins[i] for i in rng.choice(len(basins), size=batch_size, replace=False)]
+        t0s = [int(rng.choice(starts[ex.key])) for ex in batch]
+        theta_A, theta_B = net(*_network_inputs(batch, X_static, X_climate, device))
+        sims = pool.run(
+            theta_A, theta_B, [ex.key for ex in batch], [(t0, t0 + warmup + rho) for t0 in t0s]
+        )
+        losses = torch.stack([window_nse_loss(sim, ex, t0, warmup) for ex, sim, t0 in zip(batch, sims, t0s)])
+        nses += (1.0 - losses.detach().cpu()).tolist()
+
+        optimizer.zero_grad()
+        losses.mean().backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
+        optimizer.step()
+
+    return nses
+
+
 def run_training(cfg: DictConfig) -> dict:
     torch.manual_seed(cfg.seed)  # reproducible network init -- see notes/logs.md
 
@@ -134,7 +201,8 @@ def run_training(cfg: DictConfig) -> dict:
     split = build_split(cfg)
     print(
         f"  {len(split.train_ids)} train + {len(split.test_ids)} test basins, "
-        f"loaded in {time.time()-t0:.1f}s"
+        f"loaded in {time.time()-t0:.1f}s; test scored after "
+        f"{cfg.get('eval_warmup', 0)} warmup days"
     )
 
     n_static = split.X_static[split.train_ids[0]].shape[0]
@@ -166,6 +234,35 @@ def run_training(cfg: DictConfig) -> dict:
             net, pool, basins, split.X_static, split.X_climate, opt, batch_size=batch_size, rng=rng
         )
 
+    # Time-window minibatching -- see the module docstring. .get: configs
+    # built by hand (tests, results/README.md) predate these keys.
+    rho = cfg.train.get("rho", None)
+    warmup = cfg.train.get("warmup", 0) if rho is not None else 0
+    if rho is not None:
+        starts = {ex.key: window_starts(ex, warmup, rho) for ex in split.train_examples}
+        unusable = [ex.gauge_id for ex in split.train_examples if starts[ex.key].size == 0]
+        if unusable:
+            raise ValueError(
+                f"{len(unusable)} training basin(s) have no {warmup}+{rho}-day window with an "
+                f"observed day to score: {unusable}. Lengthen the training window or shorten "
+                "train.warmup/train.rho."
+            )
+        n_days = int(np.mean([len(ex.valid_mask) for ex in split.train_examples]))
+        n_iters = cfg.train.get("iters_per_epoch", None) or iterations_per_epoch(
+            len(split.train_examples), min(batch_size or len(split.train_examples), len(split.train_examples)),
+            n_days, warmup, rho,
+        )
+        print(f"  time windows: {warmup} warmup + {rho} scored days, {n_iters} steps per epoch")
+
+        def run_train_epoch():
+            return run_epoch_windows(
+                net, pool, split.train_examples, split.X_static, split.X_climate, optimizer, starts,
+                batch_size=batch_size, warmup=warmup, rho=rho, n_iters=n_iters, rng=rng,
+            )
+    else:
+        def run_train_epoch():
+            return list(run_epoch(split.train_examples, optimizer).values())
+
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, output_dir / "config.yaml")
@@ -177,14 +274,15 @@ def run_training(cfg: DictConfig) -> dict:
     history = []
     for epoch in range(1, cfg.train.n_epochs + 1):
         t0 = time.time()
-        train_nses = run_epoch(split.train_examples, optimizer)
+        train_nses = run_train_epoch()
         # Median, not mean, for reporting -- standard practice for
         # cross-basin NSE aggregation (a handful of badly-fit basins
         # shouldn't dominate the headline number the way they would
         # under a mean). The training loss itself (run_epoch_hybrid's
         # torch.stack(losses).mean()) stays a mean -- that's a distinct,
         # gradient-facing computation, not this human-facing metric.
-        median_train_nse = float(np.median(list(train_nses.values())))
+        # With time windows: median over every window sampled this epoch.
+        median_train_nse = float(np.median(train_nses))
         dt = time.time() - t0
 
         row = {"epoch": epoch, "median_train_nse": median_train_nse, "seconds": dt}
@@ -228,7 +326,7 @@ def run_training(cfg: DictConfig) -> dict:
         sims = pool.run(theta_A_test, theta_B_test, [ex.key for ex in split.test_examples])
         for ex, sim in zip(split.test_examples, sims):
             predictions[ex.gauge_id] = {
-                "sim_mm_day": sim.cpu().numpy().tolist(),
+                "sim_mm_day": ex.scored(sim).cpu().numpy().tolist(),
                 "nse": nse_value(sim, ex) if ex.valid_mask.any() else None,
             }
     pool.close()
@@ -238,6 +336,7 @@ def run_training(cfg: DictConfig) -> dict:
             "model": cfg.model.name,
             "split_mode": cfg.split.mode,
             "epoch": cfg.train.n_epochs,
+            "eval_warmup": cfg.get("eval_warmup", 0),
             "basin_ids": split.test_ids,
             "median_nse": float(np.median(valid_nses)) if valid_nses else None,
             "predictions": predictions,
@@ -252,6 +351,9 @@ def run_training(cfg: DictConfig) -> dict:
         "n_epochs": cfg.train.n_epochs,
         "lr": cfg.train.lr,
         "batch_size": batch_size,
+        "rho": rho,
+        "warmup": warmup,
+        "eval_warmup": cfg.get("eval_warmup", 0),
         "n_train_basins": len(split.train_ids),
         "n_test_basins": len(split.test_ids),
         "train_basin_ids": split.train_ids,
