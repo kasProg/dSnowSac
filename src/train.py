@@ -138,6 +138,12 @@ def run_epoch_hybrid(
     return nses
 
 
+def evaluates_at(epoch: int, eval_every: int | None, n_epochs: int) -> bool:
+    """Test-set evaluation after epoch 1, every eval_every epochs, and
+    the final epoch. eval_every 0/null: epoch 1 and the final one only."""
+    return epoch == 1 or epoch == n_epochs or bool(eval_every and epoch % eval_every == 0)
+
+
 def iterations_per_epoch(n_basins: int, batch_size: int, n_days: int, warmup: int, rho: int) -> int:
     """Gradient steps per epoch of time-window minibatching: enough that
     any given (basin, scorable day) lands in at least one sampled window
@@ -286,7 +292,7 @@ def run_training(cfg: DictConfig) -> dict:
         dt = time.time() - t0
 
         row = {"epoch": epoch, "median_train_nse": median_train_nse, "seconds": dt}
-        if epoch == 1 or epoch % cfg.train.eval_every == 0 or epoch == cfg.train.n_epochs:
+        if evaluates_at(epoch, cfg.train.eval_every, cfg.train.n_epochs):
             test_nses = run_epoch(split.test_examples, None)
             row["median_test_nse"] = float(np.median(list(test_nses.values())))
         history.append(row)

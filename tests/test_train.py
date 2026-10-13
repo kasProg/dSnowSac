@@ -244,6 +244,15 @@ def test_build_split_temporal_uses_same_basins_different_windows():
         assert train_ex.window_start != test_ex.window_start
 
 
+def test_evaluates_at():
+    from train import evaluates_at
+
+    assert [e for e in range(1, 26) if evaluates_at(e, 10, 25)] == [1, 10, 20, 25]
+    # 0/None: no periodic evaluation (and no modulo by zero).
+    for every in (0, None):
+        assert [e for e in range(1, 101) if evaluates_at(e, every, 100)] == [1, 100]
+
+
 def test_iterations_per_epoch():
     from train import iterations_per_epoch
 
