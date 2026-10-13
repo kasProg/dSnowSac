@@ -12,8 +12,8 @@
 # Override both windows per experiment.
 mode: temporal
 train_window:
-  start: "1990-10-01"
-  end: "1993-09-30"
+  start: "1999-10-01"
+  end: "2008-09-30"
 test_window:
-  start: "1993-10-01"
-  end: "1996-09-30"
+  start: "1989-10-01"
+  end: "1999-09-30"

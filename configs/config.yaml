@@ -31,7 +31,7 @@ eval_warmup: 365
 # available). The Fortran physics always runs on CPU regardless. The
 # saved results/runs/ were trained on CPU; CUDA kernels are not
 # bitwise-identical to CPU ones, so use device=cpu to reproduce them.
-device: cuda
+device: cuda:0
 
 # Worker processes for the Fortran physics (src/physics_pool.py). Each
 # basin's 27 gradient passes are spread across them; 0 runs everything

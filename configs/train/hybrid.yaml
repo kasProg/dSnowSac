@@ -2,14 +2,14 @@
 # basins over the 9-year split=spatial window; each basin costs 27
 # forward-mode passes per gradient. ~2 s/epoch with n_workers=32 on a
 # shared 104-core server (~55 s serial), so 150 epochs is ~6 minutes.
-n_epochs: 150
+n_epochs: 100
 eval_every: 10
 lr: 3e-3
 # Basins per gradient step. null = all training basins, one full-batch
 # step per epoch (what every saved run used). A smaller value takes
 # several shuffled minibatch steps per epoch -- worth it once the basin
 # count grows well past what one step should average over.
-batch_size: null
+batch_size: 100
 # Time-window minibatching (HydroDL-style). null = every step runs each
 # basin's full training window (what every saved run used). Set to e.g.
 # 365: each step draws batch_size distinct random basins (null = all) and
@@ -18,7 +18,7 @@ batch_size: null
 # training-window variance (src/data_module.py's window_nse_loss). The
 # training window must hold at least warmup + rho days. median_train_nse
 # is then the median over every window sampled in the epoch.
-rho: null
+rho: 365
 warmup: 365
 # Steps per epoch when rho is set. null = enough that each (basin, day)
 # is scored with ~99% probability (src/train.py's iterations_per_epoch).
