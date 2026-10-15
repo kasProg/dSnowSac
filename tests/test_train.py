@@ -21,6 +21,7 @@ independent of configs/*.yaml's exact file layout (still exercises the
 same build_split()/run_epoch_hybrid() code path run_training() uses).
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -324,7 +325,7 @@ def test_window_epoch_samples_valid_windows_and_steps_per_iteration():
         n_climate_features=split.X_climate[basins[0].gauge_id].shape[1],
     )
     optimizer = torch.optim.Adam(net.parameters(), lr=3e-3)
-    steps, calls = [], []
+    steps, calls, step_losses = [], [], []
     real_step = optimizer.step
     optimizer.step = lambda *a, **k: (steps.append(1), real_step(*a, **k))[1]
 
@@ -341,9 +342,13 @@ def test_window_epoch_samples_valid_windows_and_steps_per_iteration():
         nses = run_epoch_windows(
             net, pool, basins, split.X_static, split.X_climate, optimizer, starts,
             batch_size=2, warmup=warmup, rho=rho, n_iters=3, rng=np.random.default_rng(0),
+            on_step=step_losses.append,
         )
 
     assert len(steps) == 3 and len(calls) == 3 and len(nses) == 6
+    # Progress callback: once per optimizer step, with the batch-mean loss.
+    assert len(step_losses) == 3 and all(np.isfinite(step_losses))
+    np.testing.assert_allclose(step_losses[0], 1.0 - np.mean(nses[:2]), rtol=1e-10)
     assert all(np.isfinite(nses))
     for keys, windows, lengths in calls:
         assert len(set(keys)) == 2
@@ -417,3 +422,58 @@ def test_eval_warmup_reaches_before_the_streamflow_record():
     ex = BasinExample("02427250", pd.Timestamp("1989-10-01"), pd.Timestamp("1990-09-30"), warmup=365)
     assert len(ex.snow17_forcing.pcp) == 365 + 365
     assert len(ex.valid_mask) == 365 and bool(ex.valid_mask[0])
+
+
+def _small_run_cfg(output_dir: Path, n_epochs: int):
+    from hydra import compose, initialize_config_dir
+
+    with initialize_config_dir(version_base=None, config_dir=str(REPO_ROOT / "configs")):
+        return compose("config", overrides=[
+            "data=camels_snow35", "split=spatial", "device=cpu", "n_workers=0", "eval_warmup=0",
+            f"train.n_epochs={n_epochs}", "train.eval_every=2", "train.checkpoint_every=2",
+            "train.batch_size=4", "train.iters_per_epoch=2", "train.rho=60", "train.warmup=30",
+            f"output_dir={output_dir}",
+        ])
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_resume_matches_an_uninterrupted_run(tmp_path, monkeypatch):
+    """Stopping after epoch 2 and resuming to epoch 4 must give bitwise
+    the same weights and history as running 4 epochs straight -- or the
+    resumed half of a run silently differs from what it claims to be."""
+    import torch
+    from train import resume_cli, run_training
+
+    monkeypatch.chdir(REPO_ROOT)
+    run_training(_small_run_cfg(tmp_path / "straight", 4))
+    run_training(_small_run_cfg(tmp_path / "stopped", 2))
+    resume_cli(str(tmp_path / "stopped"), ["train.n_epochs=4"])
+
+    def weights(name):
+        return torch.load(tmp_path / name / "checkpoint.pt", weights_only=True)
+
+    def history(name):
+        rows = json.loads((tmp_path / name / "history.json").read_text())["history"]
+        return [{k: v for k, v in row.items() if k != "seconds"} for row in rows]
+
+    straight, resumed = weights("straight"), weights("stopped")
+    assert all(torch.equal(straight[k], resumed[k]) for k in straight)
+    assert history("stopped") == history("straight")
+    assert [row["epoch"] for row in history("stopped")] == [1, 2, 3, 4]
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_resume_from_checkpoint_without_rng_state(tmp_path, monkeypatch):
+    """Checkpoints written before RNG state and history were saved still
+    resume; history.json then starts at the resumed epoch."""
+    import torch
+    from train import resume_cli, run_training
+
+    monkeypatch.chdir(REPO_ROOT)
+    run_training(_small_run_cfg(tmp_path, 2))
+    path = tmp_path / "checkpoints" / "epoch_0002.pt"
+    ckpt = torch.load(path, weights_only=False)
+    torch.save({k: ckpt[k] for k in ("epoch", "model_state_dict", "optimizer_state_dict")}, path)
+    resume_cli(str(tmp_path), ["train.n_epochs=3"])
+    rows = json.loads((tmp_path / "history.json").read_text())["history"]
+    assert [row["epoch"] for row in rows] == [3]

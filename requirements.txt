@@ -5,3 +5,4 @@ torch
 tesseract-core[runtime]>=1.14  # per-input eps in the finite-difference helpers
 tesseract-torch
 hydra-core
+tqdm

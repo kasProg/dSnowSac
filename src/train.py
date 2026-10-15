@@ -6,6 +6,7 @@ README's "Reproducing experiments" section.
 
     .venv/bin/python src/train.py                # spatial split (default)
     .venv/bin/python src/train.py split=temporal seed=1
+    .venv/bin/python src/train.py --resume results/runs/<run>   # continue a stopped run
 
 Kept as a plain function (run_training(cfg)) wrapped by a thin
 @hydra.main CLI (cli()) at the bottom -- tests and results/README.md's
@@ -47,14 +48,17 @@ basins) and notes/logs.md for the full removal rationale.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -71,6 +75,9 @@ from data_module import (  # noqa: E402
 )
 from model_factory import build_model, resolve_device  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
+
+# Called after every optimizer step with that step's mean loss (progress bars).
+StepCallback = Callable[[float], None]
 
 
 def _network_inputs(basins, X_static: dict, X_climate: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -92,6 +99,7 @@ def run_epoch_hybrid(
     optimizer: torch.optim.Optimizer | None,
     batch_size: int | None = None,
     rng: np.random.Generator | None = None,
+    on_step: StepCallback | None = None,
 ) -> dict[str, float]:
     """Returns {gauge_id: nse}.
 
@@ -131,9 +139,12 @@ def run_epoch_hybrid(
         nses.update({ex.gauge_id: nse_value(sim, ex) for ex, sim in zip(batch, sims)})
 
         optimizer.zero_grad()
-        torch.stack(losses).mean().backward()
+        loss = torch.stack(losses).mean()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
         optimizer.step()
+        if on_step is not None:
+            on_step(loss.item())
 
     return nses
 
@@ -170,6 +181,7 @@ def run_epoch_windows(
     rho: int,
     n_iters: int,
     rng: np.random.Generator,
+    on_step: StepCallback | None = None,
 ) -> list[float]:
     """n_iters gradient steps, each on batch_size distinct basins drawn
     at random, each basin on a random window [s, s + warmup + rho) with s
@@ -192,14 +204,24 @@ def run_epoch_windows(
         nses += (1.0 - losses.detach().cpu()).tolist()
 
         optimizer.zero_grad()
-        losses.mean().backward()
+        loss = losses.mean()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
         optimizer.step()
+        if on_step is not None:
+            on_step(loss.item())
 
     return nses
 
 
-def run_training(cfg: DictConfig) -> dict:
+def latest_checkpoint(output_dir: Path) -> Path | None:
+    checkpoints = sorted((output_dir / "checkpoints").glob("epoch_*.pt"))
+    return checkpoints[-1] if checkpoints else None
+
+
+def run_training(cfg: DictConfig, resume: bool = False) -> dict:
+    """resume: continue from the latest checkpoint in cfg.output_dir
+    instead of starting at epoch 1 (see main())."""
     torch.manual_seed(cfg.seed)  # reproducible network init -- see notes/logs.md
 
     print(f"Loading basins (data={cfg.data.name}, split={cfg.split.mode})...")
@@ -235,9 +257,10 @@ def run_training(cfg: DictConfig) -> dict:
     # network init or dropout draws.
     rng = np.random.default_rng(cfg.seed)
 
-    def run_epoch(basins, opt):
+    def run_epoch(basins, opt, on_step=None):
         return run_epoch_hybrid(
-            net, pool, basins, split.X_static, split.X_climate, opt, batch_size=batch_size, rng=rng
+            net, pool, basins, split.X_static, split.X_climate, opt,
+            batch_size=batch_size, rng=rng, on_step=on_step,
         )
 
     # Time-window minibatching -- see the module docstring. .get: configs
@@ -260,14 +283,20 @@ def run_training(cfg: DictConfig) -> dict:
         )
         print(f"  time windows: {warmup} warmup + {rho} scored days, {n_iters} steps per epoch")
 
-        def run_train_epoch():
+        steps_per_epoch = n_iters
+
+        def run_train_epoch(on_step):
             return run_epoch_windows(
                 net, pool, split.train_examples, split.X_static, split.X_climate, optimizer, starts,
                 batch_size=batch_size, warmup=warmup, rho=rho, n_iters=n_iters, rng=rng,
+                on_step=on_step,
             )
     else:
-        def run_train_epoch():
-            return list(run_epoch(split.train_examples, optimizer).values())
+        n_train = len(split.train_examples)
+        steps_per_epoch = math.ceil(n_train / min(batch_size or n_train, n_train))
+
+        def run_train_epoch(on_step):
+            return list(run_epoch(split.train_examples, optimizer, on_step).values())
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -277,10 +306,55 @@ def run_training(cfg: DictConfig) -> dict:
     save_normalization(cfg.data, output_dir / "normalization.npz")
     checkpoints_dir = output_dir / "checkpoints"
 
+    # Progress (stderr; TQDM_DISABLE=1 turns it off). The run bar uses the
+    # average rate since the start (smoothing=0), so its remaining-time
+    # estimate also covers the evaluation and checkpoint pauses so far.
+    n_epochs = cfg.train.n_epochs
     history = []
-    for epoch in range(1, cfg.train.n_epochs + 1):
+    start_epoch = 1
+    if resume:
+        checkpoint_path = latest_checkpoint(output_dir)
+        if checkpoint_path is None:
+            raise FileNotFoundError(f"--resume: no checkpoints/epoch_*.pt in {output_dir}")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        history = ckpt.get("history", [])
+        if "numpy_rng_state" in ckpt:
+            # Same window draws and dropout masks as an uninterrupted run.
+            rng.bit_generator.state = ckpt["numpy_rng_state"]
+            torch.set_rng_state(ckpt["torch_rng_state"])
+            if ckpt.get("cuda_rng_state") is not None and device.type == "cuda":
+                torch.cuda.set_rng_state(ckpt["cuda_rng_state"], device)
+        else:
+            # Checkpoints from before RNG state was saved: fresh streams,
+            # distinct from the ones epoch 1 started with.
+            rng = np.random.default_rng([cfg.seed, start_epoch])
+            torch.manual_seed(cfg.seed * 100_003 + start_epoch)
+            print("  checkpoint has no RNG state: the rest of this run's random draws "
+                  "differ from an uninterrupted run's")
+        print(f"Resuming from {checkpoint_path} at epoch {start_epoch}"
+              + ("" if history else " (checkpoint has no history: history.json starts here)"))
+
+    run_bar = tqdm(
+        total=n_epochs * steps_per_epoch, initial=(start_epoch - 1) * steps_per_epoch,
+        desc="run", unit="step", position=0, smoothing=0, dynamic_ncols=True,
+    )
+    for epoch in range(start_epoch, n_epochs + 1):
         t0 = time.time()
-        train_nses = run_train_epoch()
+        epoch_bar = tqdm(
+            total=steps_per_epoch, desc=f"epoch {epoch}/{n_epochs}", unit="step", position=1,
+            leave=False, dynamic_ncols=True,
+        )
+
+        def on_step(loss: float) -> None:
+            epoch_bar.set_postfix(loss=f"{loss:.4f}", refresh=False)
+            epoch_bar.update()
+            run_bar.update()
+
+        train_nses = run_train_epoch(on_step)
+        epoch_bar.close()
         # Median, not mean, for reporting -- standard practice for
         # cross-basin NSE aggregation (a handful of badly-fit basins
         # shouldn't dominate the headline number the way they would
@@ -293,10 +367,12 @@ def run_training(cfg: DictConfig) -> dict:
 
         row = {"epoch": epoch, "median_train_nse": median_train_nse, "seconds": dt}
         if evaluates_at(epoch, cfg.train.eval_every, cfg.train.n_epochs):
+            run_bar.set_postfix_str("evaluating test set")
             test_nses = run_epoch(split.test_examples, None)
+            run_bar.set_postfix_str("")
             row["median_test_nse"] = float(np.median(list(test_nses.values())))
         history.append(row)
-        print(
+        tqdm.write(
             f"epoch {epoch:3d}  train_nse={median_train_nse:+.4f}"
             + (f"  test_nse={row.get('median_test_nse'):+.4f}" if "median_test_nse" in row else "")
             + f"  ({dt:.2f}s)"
@@ -314,10 +390,16 @@ def run_training(cfg: DictConfig) -> dict:
                     "epoch": epoch,
                     "model_state_dict": net.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    # What --resume needs to continue exactly as if never stopped.
+                    "history": history,
+                    "numpy_rng_state": rng.bit_generator.state,
+                    "torch_rng_state": torch.get_rng_state(),
+                    "cuda_rng_state": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
                 },
                 checkpoints_dir / f"epoch_{epoch:04d}.pt",
             )
 
+    run_bar.close()
     torch.save(net.state_dict(), output_dir / "checkpoint.pt")
 
     # Final-epoch predictions on the test (heldout) set -- same shape as
@@ -377,5 +459,21 @@ def cli(cfg: DictConfig) -> None:
     run_training(cfg)
 
 
+def resume_cli(run_dir: str, overrides: list[str]) -> None:
+    """Continue a stopped run with the config it was started with
+    (run_dir/config.yaml), writing into the same directory. Bypasses
+    Hydra so it neither makes a new run directory nor overwrites the
+    run's .hydra/ record. key=value overrides (e.g. train.n_epochs=150
+    to train longer) are merged on top."""
+    run_dir = Path(run_dir)
+    cfg = OmegaConf.load(run_dir / "config.yaml")
+    cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+    cfg.output_dir = str(run_dir)
+    run_training(cfg, resume=True)
+
+
 if __name__ == "__main__":
-    cli()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--resume":
+        resume_cli(sys.argv[2], sys.argv[3:])
+    else:
+        cli()
