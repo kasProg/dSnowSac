@@ -8,7 +8,7 @@
 n_epochs: 100
 # Test-set evaluation every N epochs, plus after epoch 1 and the last
 # epoch. 0 = only those two.
-eval_every: 0
+eval_every: 10
 lr: 3e-3
 # Basins per gradient step. null = all training basins, one full-batch
 # step per epoch (what every saved run used). A smaller value takes
