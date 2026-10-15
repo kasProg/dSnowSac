@@ -17,7 +17,10 @@ the natural fit (few parameters, one wide intermediate flux, scalar loss).
 
 from __future__ import annotations
 
+import multiprocessing.util
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -96,8 +99,30 @@ class CoupledNWSStack:
     """
 
     def __init__(self) -> None:
-        self._snow17 = Tesseract.from_tesseract_api(str(SNOW17_TESSERACT_DIR / "tesseract_api.py"))
-        self._sacsma = Tesseract.from_tesseract_api(str(SACSMA_TESSERACT_DIR / "tesseract_api.py"))
+        # Every Tesseract endpoint call writes a run_<uuid>/logs/ directory
+        # (~20 KB) into its client's output path. Left to the SDK, that is a
+        # fresh /tmp/tesseract_output_* removed only when the client is
+        # garbage collected -- which worker processes never reach -- and a
+        # training run makes millions of calls: it filled the disk. So both
+        # clients write into one directory this stack owns, emptied after
+        # every physics run (clear_run_logs) and removed at process exit
+        # (multiprocessing's Finalize also runs in pool workers, unlike atexit).
+        self._run_dir = Path(tempfile.mkdtemp(prefix="dsnowsac_tesseract_runs_"))
+        multiprocessing.util.Finalize(
+            self, shutil.rmtree, args=(str(self._run_dir),), kwargs={"ignore_errors": True},
+            exitpriority=0,
+        )
+        self._snow17 = Tesseract.from_tesseract_api(
+            str(SNOW17_TESSERACT_DIR / "tesseract_api.py"), output_path=self._run_dir
+        )
+        self._sacsma = Tesseract.from_tesseract_api(
+            str(SACSMA_TESSERACT_DIR / "tesseract_api.py"), output_path=self._run_dir
+        )
+
+    def clear_run_logs(self) -> None:
+        """Delete the per-call run directories Tesseract has written so far."""
+        for path in self._run_dir.iterdir():
+            shutil.rmtree(path, ignore_errors=True)
 
     def make_physics(self, snow17_forcing: Snow17Forcing, sacsma_forcing: SacSmaForcing):
         """Build the physics(theta_A, theta_B) -> runoff callable that
@@ -111,6 +136,12 @@ class CoupledNWSStack:
         sf, cf = snow17_forcing, sacsma_forcing
 
         def physics(theta_A: torch.Tensor, theta_B: torch.Tensor) -> torch.Tensor:
+            try:
+                return chain(theta_A, theta_B)
+            finally:
+                self.clear_run_logs()
+
+        def chain(theta_A: torch.Tensor, theta_B: torch.Tensor) -> torch.Tensor:
             snow17_inputs = dict(
                 idt=sf.idt, idts=sf.idts, iyr=sf.iyr, imn=sf.imn, ida=sf.ida,
                 pcp=sf.pcp.astype(np.float32), tmp=sf.tmp.astype(np.float32),

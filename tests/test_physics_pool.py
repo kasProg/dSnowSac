@@ -131,3 +131,34 @@ def test_windowed_job_matches_presliced_forcing(two_basins, n_workers):
         assert torch.equal(sim.detach(), ref)
     assert torch.equal(tA.grad, ref_grad_A)
     assert torch.equal(tB.grad, ref_grad_B)
+
+
+def _run_dirs():
+    import glob
+    import tempfile
+
+    tmp = Path(tempfile.gettempdir())
+    # Ours, plus the SDK's own default output dirs, which must not appear.
+    return set(glob.glob(str(tmp / "dsnowsac_tesseract_runs_*"))) | set(
+        glob.glob(str(tmp / "tesseract_output_*"))
+    )
+
+
+@pytest.mark.parametrize("n_workers", [0, 2])
+def test_tesseract_run_logs_do_not_accumulate(two_basins, n_workers):
+    """Tesseract writes a run directory per endpoint call; a gradient run
+    makes dozens of calls per basin and training millions. Nothing may be
+    left behind after a run, and each worker's directory must be gone once
+    the pool shuts down -- an earlier version filled the disk this way."""
+    _stack, forcings, theta_A, theta_B = two_basins
+    before = _run_dirs()
+    tA, tB = _leaves(theta_A, theta_B)
+    with PhysicsPool(forcings, n_workers=n_workers) as pool:
+        pool.run(tA, tB, ["b0", "b1"])
+    left = _run_dirs() - before
+    if n_workers == 0:
+        # The in-process stack keeps its (emptied) directory until exit.
+        assert left == {str(pool._stack._run_dir)}
+        assert list(pool._stack._run_dir.iterdir()) == []
+    else:
+        assert not left, f"Tesseract run directories left behind: {left}"
