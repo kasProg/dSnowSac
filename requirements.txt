@@ -2,7 +2,7 @@ numpy
 pandas
 pytest
 torch
-tesseract-core[runtime]>=1.14  # per-input eps in the finite-difference helpers
+tesseract-core[runtime]>=1.15  # 1.14: per-input FD eps; 1.15: cached gradient-endpoint validators (~4x faster JVPs)
 tesseract-torch
 hydra-core
 tqdm
