@@ -1,0 +1,9 @@
+# src/paramnet.py's DailyParamNet: dHBV-style LSTM (Feng et al., 2022)
+# over each basin's daily [prcp, tmean, pet] for the split's whole
+# training window, static attributes joined at every timestep -> 27
+# bounded Snow17/SAC-SMA parameters, ONE set per basin (time-mean
+# readout, not dHBV's last-timestep one). No routing, one model copy
+# per basin -- see the class docstring for every difference from dHBV.
+name: hybrid_daily
+hidden: 256
+dropout: 0.5

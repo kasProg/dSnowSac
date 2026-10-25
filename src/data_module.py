@@ -131,15 +131,33 @@ class BasinExample:
         return sim[self.warmup :]
 
 
-def masked_nse_loss(sim: torch.Tensor, example: BasinExample) -> torch.Tensor:
-    """1 - NSE, computed only over non-missing observed days of the
-    example's window (sim covers its warmup too; see BasinExample.scored).
-    Runs on sim's device; the example's observations are kept on CPU and
-    moved per call (one series per basin -- negligible next to the physics)."""
+def scored_pair(sim: torch.Tensor, example: BasinExample) -> tuple[torch.Tensor, torch.Tensor]:
+    """(sim, obs) on the non-missing observed days of the example's
+    window (sim covers its warmup too; see BasinExample.scored). Runs on
+    sim's device; the example's observations are kept on CPU and moved
+    per call (one series per basin -- negligible next to the physics)."""
     sim = example.scored(sim)
     mask = example.valid_mask.to(sim.device)
-    obs = example.observed.to(sim.device)[mask]
-    sim_valid = sim[mask]
+    return sim[mask], example.observed.to(sim.device)[mask]
+
+
+def window_pair(
+    sim: torch.Tensor, example: BasinExample, start: int, warmup: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(sim, obs) on the scored, non-missing observed days of one
+    sampled time window -- see window_nse_loss for what sim covers."""
+    # Indexes observations by forcing position: only valid without an
+    # example-level warmup prepended to the forcing.
+    assert example.warmup == 0, "time-window training needs examples built with warmup=0"
+    stop = start + sim.shape[0]
+    mask = example.valid_mask[start + warmup : stop].to(sim.device)
+    return sim[warmup:][mask], example.observed[start + warmup : stop].to(sim.device)[mask]
+
+
+def masked_nse_loss(sim: torch.Tensor, example: BasinExample) -> torch.Tensor:
+    """1 - NSE, computed only over non-missing observed days of the
+    example's window (see scored_pair)."""
+    sim_valid, obs = scored_pair(sim, example)
     denom = torch.clamp(torch.sum((obs - obs.mean()) ** 2), min=1e-6)
     nse = 1.0 - torch.sum((obs - sim_valid) ** 2) / denom
     return 1.0 - nse
@@ -161,14 +179,35 @@ def window_nse_loss(sim: torch.Tensor, example: BasinExample, start: int, warmup
     sub-window. A per-window NSE would divide by one year's variance:
     a flat dry year would get a tiny denominator and dominate the batch.
     With warmup=0 and the full window this equals masked_nse_loss."""
-    # Indexes observations by forcing position: only valid without an
-    # example-level warmup prepended to the forcing.
-    assert example.warmup == 0, "time-window training needs examples built with warmup=0"
-    stop = start + sim.shape[0]
-    mask = example.valid_mask[start + warmup : stop].to(sim.device)
-    obs = example.observed[start + warmup : stop].to(sim.device)[mask]
-    sim_valid = sim[warmup:][mask]
+    sim_valid, obs = window_pair(sim, example, start, warmup)
     return torch.mean((obs - sim_valid) ** 2) / example.obs_variance
+
+
+def rmse_comb_loss(
+    pairs: list[tuple[torch.Tensor, torch.Tensor]], alpha: float = 0.25, beta: float = 1e-6
+) -> torch.Tensor:
+    """Feng et al. (2022, WRR)'s combined loss for dHBV, written from
+    the paper's equation:
+
+        (1 - alpha) * RMSE(q) + alpha * RMSE(log10(sqrt(q + beta) + 0.1))
+
+    The transformed term weights low flows and recessions, which the raw
+    RMSE (dominated by peaks) barely sees; beta keeps sqrt's gradient
+    finite at q = 0. Both RMSEs are POOLED over every (sim, obs) pair of
+    the minibatch -- one per basin, from scored_pair/window_pair -- as
+    over their [time, basin] batch tensor, not averaged per basin: unlike
+    the NSE losses above, a basin weighs by its flow magnitude and its
+    number of observed days. sim >= 0: SAC-SMA clamps TCI at zero
+    (external/sac-sma/src/sac/sac1.f90, after the riparian ET E4)."""
+    sim = torch.cat([s for s, _ in pairs])
+    obs = torch.cat([o for _, o in pairs])
+
+    def transform(q):
+        return torch.log10(torch.sqrt(q + beta) + 0.1)
+
+    rmse = torch.sqrt(torch.mean((sim - obs) ** 2))
+    rmse_log = torch.sqrt(torch.mean((transform(sim) - transform(obs)) ** 2))
+    return (1.0 - alpha) * rmse + alpha * rmse_log
 
 
 def window_starts(example: BasinExample, warmup: int, rho: int) -> np.ndarray:
@@ -205,14 +244,33 @@ def load_basin_features(data_cfg) -> tuple[pd.DataFrame, dict, dict]:
 _NORM_KEYS = ("mean", "std", "feature_names")
 
 
-def save_normalization(data_cfg, path: Path) -> None:
+def save_normalization(data_cfg, path: Path, forcing_stats: tuple | None = None) -> None:
+    """forcing_stats: (mean, std) from forcing_normalization, for a
+    network reading daily forcing (model=hybrid_daily)."""
     attrs = np.load(data_cfg.attributes_npz, allow_pickle=True)
     clim = np.load(data_cfg.climatology_npz, allow_pickle=True)
+    forcing = {}
+    if forcing_stats is not None:
+        forcing = {
+            "forcing_mean": forcing_stats[0],
+            "forcing_std": forcing_stats[1],
+            "forcing_feature_names": np.array(FORCING_FEATURES),
+        }
     np.savez(
         path,
         **{f"static_{k}": attrs[k] for k in _NORM_KEYS},
         **{f"climate_{k}": clim[k] for k in _NORM_KEYS},
+        **forcing,
     )
+
+
+def load_forcing_normalization(norm_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """The (mean, std) the network's daily forcing was scaled with in
+    training -- inference must reuse them, not recompute its own."""
+    saved = np.load(norm_path, allow_pickle=True)
+    if "forcing_mean" not in saved:
+        raise ValueError(f"{norm_path} has no forcing statistics: not from a model=hybrid_daily run")
+    return saved["forcing_mean"], saved["forcing_std"]
 
 
 def apply_training_normalization(
@@ -253,7 +311,48 @@ class SplitData:
     train_ids: list[str]
     test_ids: list[str]
     X_static: dict
+    # The network's sequence input by gauge_id: the monthly climatology,
+    # or for model=hybrid_daily the daily forcing train_period_forcing()
+    # returns, swapped in by src/train.py / src/infer.py.
     X_climate: dict
+
+
+FORCING_FEATURES = ("prcp", "tmean", "pet")
+
+
+def train_period_forcing(split: SplitData) -> dict[str, np.ndarray]:
+    """(T, 3) raw daily [prcp, tmean, pet] by gauge_id over the split's
+    training window -- DailyParamNet's input, the same sequence for every
+    window a basin is trained or scored on, so it gets one parameter set.
+
+    Cut from the examples' own forcing rather than reloaded: the
+    training examples cover the training window; in a spatial split the
+    test basins share that window (their eval_warmup days are dropped),
+    in a temporal split they are the training basins."""
+    w0, w1 = split.train_examples[0].window_start, split.train_examples[0].window_end
+    forcing = {}
+    for ex in split.train_examples + split.test_examples:
+        if ex.gauge_id in forcing:
+            continue
+        if (ex.window_start, ex.window_end) != (w0, w1):
+            raise ValueError(f"{ex.gauge_id}: no example over the training window {w0.date()}..{w1.date()}")
+        x = np.stack([ex.snow17_forcing.pcp, ex.snow17_forcing.tmp, ex.sacsma_forcing.etp], axis=1)
+        forcing[ex.gauge_id] = x[ex.warmup :].astype(np.float64)
+        assert np.isfinite(forcing[ex.gauge_id]).all(), f"{ex.gauge_id}: non-finite forcing"
+    return forcing
+
+
+def forcing_normalization(forcing: dict, gauge_ids: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-feature (mean, std) over every day of the given basins --
+    the training basins, so test basins never shape their own scaling."""
+    x = np.concatenate([forcing[g] for g in gauge_ids])
+    mean, std = x.mean(axis=0), x.std(axis=0)
+    std[std == 0] = 1.0
+    return mean, std
+
+
+def normalize_forcing(forcing: dict, mean: np.ndarray, std: np.ndarray) -> dict:
+    return {g: (x - mean) / std for g, x in forcing.items()}
 
 
 def _build_examples(gauge_ids: list[str], start: str, end: str, warmup: int = 0) -> list[BasinExample]:

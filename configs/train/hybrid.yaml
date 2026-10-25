@@ -25,6 +25,17 @@ batch_size: 100
 # is then the median over every window sampled in the epoch.
 rho: 365
 warmup: 365
+# Training loss (src/train.py's training_loss). nse: mean over basins of
+# each basin's 1 - NSE (window_nse_loss with rho set, masked_nse_loss
+# without) -- what every saved run used. rmse_comb: Feng et al. (2022)'s
+# dHBV loss, (1 - alpha) * RMSE(q) + alpha * RMSE(log10(sqrt(q + beta)
+# + 0.1)), pooled over the minibatch's (day, basin) pairs
+# (src/data_module.py's rmse_comb_loss). alpha/beta only apply to it.
+# median_train_nse/median_test_nse are NSE either way.
+loss:
+  name: nse
+  alpha: 0.25
+  beta: 1.0e-6
 # Steps per epoch when rho is set. null = enough that each (basin, day)
 # is scored with ~99% probability (src/train.py's iterations_per_epoch).
 iters_per_epoch: null

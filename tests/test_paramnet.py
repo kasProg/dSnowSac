@@ -90,3 +90,86 @@ def test_gradient_flows_to_every_network_parameter():
         "all gradients are exactly zero -- silently disconnected from the "
         "loss despite grad_fn being set"
     )
+
+
+def test_saved_paramnet_checkpoints_still_load():
+    """ParamNet now shares its bounding with DailyParamNet through a base
+    class; its state_dict keys must not have moved, or every saved run's
+    checkpoint.pt stops loading."""
+    import pytest
+
+    path = REPO_ROOT / "results" / "runs" / "model_9yrs_spatial" / "checkpoint.pt"
+    if not path.exists():
+        pytest.skip("no saved checkpoint")
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    ParamNet(n_static_features=state["head.0.weight"].shape[1] - 32).load_state_dict(state)
+
+
+N_DAYS = 400
+
+
+def _make_daily(batch: int, seed: int = 0, dropout: float = 0.5):
+    from paramnet import DailyParamNet
+
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+    net = DailyParamNet(n_static_features=N_STATIC, hidden=32, dropout=dropout)
+    x_static = torch.tensor(rng.normal(0, 1, (batch, N_STATIC)), dtype=torch.float64)
+    x_forcing = torch.tensor(rng.normal(0, 1, (batch, N_DAYS, 3)), dtype=torch.float64)
+    return net, x_static, x_forcing
+
+
+def test_daily_paramnet_shapes_dtypes_and_bounds():
+    net, x_static, x_forcing = _make_daily(6)
+    theta_A, theta_B = net(x_static * 50.0, x_forcing * 50.0)  # extreme inputs
+    assert theta_A.shape == (6, 11) and theta_A.dtype == torch.float32
+    assert theta_B.shape == (6, 16) and theta_B.dtype == torch.float64
+    for theta, names, bounds in (
+        (theta_A, net.snow17_names, SNOW17_BOUNDS),
+        (theta_B, net.sacsma_names, SACSMA_BOUNDS),
+    ):
+        lo = torch.tensor([bounds[n][0] for n in names], dtype=theta.dtype)
+        hi = torch.tensor([bounds[n][1] for n in names], dtype=theta.dtype)
+        assert torch.all(theta >= lo) and torch.all(theta <= hi)
+
+
+def test_daily_paramnet_basins_do_not_mix():
+    """A basin's parameters must not depend on which other basins share
+    its batch -- catches pooling over the batch dimension instead of
+    time, which would look like training just fine."""
+    net, x_static, x_forcing = _make_daily(4)
+    net.eval()
+    with torch.no_grad():
+        theta_A, theta_B = net(x_static, x_forcing)
+        alone_A, alone_B = net(x_static[2:3], x_forcing[2:3])
+    torch.testing.assert_close(alone_A[0], theta_A[2])
+    torch.testing.assert_close(alone_B[0], theta_B[2])
+
+
+def test_daily_paramnet_reads_every_day_and_the_statics():
+    """Time-mean readout: the FIRST day's forcing must move the
+    parameters about as much as the last day's (measured ~1.9x here; a
+    last-step readout over these 400 days gives exactly 0), and the
+    static attributes must move them too."""
+    net, x_static, x_forcing = _make_daily(2, dropout=0.0)
+    x_static.requires_grad_(True)
+    x_forcing.requires_grad_(True)
+    theta_A, theta_B = net(x_static, x_forcing)
+    (theta_A.double().sum() + theta_B.sum()).backward()
+    per_day = x_forcing.grad.abs().sum(dim=(0, 2))
+    assert per_day[0] > 0.1 * per_day[-1]
+    assert x_static.grad.abs().sum() > 0
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())
+
+
+def test_daily_paramnet_chunked_eval_matches_one_batch():
+    """No-grad forwards run EVAL_CHUNK basins at a time; the chunk
+    boundaries must not reorder, drop or alter any basin's parameters."""
+    net, x_static, x_forcing = _make_daily(7)
+    net.eval()
+    with torch.no_grad():
+        whole_A, whole_B = net(x_static, x_forcing)
+        net.EVAL_CHUNK = 3  # 3 + 3 + 1
+        chunked_A, chunked_B = net(x_static, x_forcing)
+    torch.testing.assert_close(chunked_A, whole_A)
+    torch.testing.assert_close(chunked_B, whole_B)

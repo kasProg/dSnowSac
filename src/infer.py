@@ -34,8 +34,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "data"))
 
-from data_module import apply_training_normalization, build_split, nse_value  # noqa: E402
-from model_factory import build_model, resolve_device  # noqa: E402
+from data_module import (  # noqa: E402
+    apply_training_normalization,
+    build_split,
+    load_forcing_normalization,
+    normalize_forcing,
+    nse_value,
+    train_period_forcing,
+)
+from model_factory import build_model, resolve_device, uses_daily_forcing  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
 
 
@@ -69,6 +76,11 @@ def run_inference(cfg: DictConfig) -> dict:
         print(
             f"  WARNING: no normalization.npz next to {ckpt_path.name}; using this basin "
             "list's own feature scaling, which is only right if it is the training list"
+        )
+    if uses_daily_forcing(cfg):
+        # The training run's forcing statistics; there is no fallback.
+        split.X_climate = normalize_forcing(
+            train_period_forcing(split), *load_forcing_normalization(norm_path)
         )
 
     n_static = split.X_static[all_ids[0]].shape[0]

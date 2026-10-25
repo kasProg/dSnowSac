@@ -1,5 +1,8 @@
 """LSTM-encoder + MLP head predicting Snow17 + SAC-SMA parameters from
-basin static attributes AND a monthly climatology sequence.
+basin static attributes AND a monthly climatology sequence (ParamNet,
+model=hybrid). DailyParamNet (model=hybrid_daily, see its docstring) is
+the dHBV-style alternative reading daily forcing instead; everything
+below about static parameters and bounding holds for both.
 
 Two inputs:
   x_static:  (batch, 39) z-score-normalized CAMELS static attributes
@@ -97,25 +100,19 @@ SACSMA_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 
-class ParamNet(nn.Module):
-    """forward(x_static, x_climate) -> (theta_A, theta_B):
-    (batch, 11) float32, (batch, 16) float64 -- dtypes match what
-    src/pipeline.py's CoupledNWSStack.run() (and src/coupling.py's
-    per-leaf dtype handling) expect for Snow17 vs. SAC-SMA respectively.
-    """
+class _BoundedParams(nn.Module):
+    """The output side both networks share: raw (batch, 27) network
+    output -> (theta_A, theta_B), (batch, 11) float32 and (batch, 16)
+    float64 -- dtypes match what src/pipeline.py's CoupledNWSStack.run()
+    (and src/coupling.py's per-leaf dtype handling) expect for Snow17 vs.
+    SAC-SMA respectively -- each parameter sigmoid-mapped into its
+    *_BOUNDS range."""
 
-    def __init__(
-        self,
-        n_static_features: int,
-        n_climate_features: int = 3,
-        lstm_hidden: int = 32,
-        mlp_hidden: int = 64,
-        n_hidden_layers: int = 2,
-        dropout: float = 0.1,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.snow17_names = SNOW17_PARAMS
         self.sacsma_names = SACSMA_PARAMS
+        self.n_params = len(self.snow17_names) + len(self.sacsma_names)
 
         snow17_bounds = torch.tensor(
             [SNOW17_BOUNDS[n] for n in self.snow17_names], dtype=torch.float64
@@ -131,17 +128,41 @@ class ParamNet(nn.Module):
         self.register_buffer("sacsma_lo", sacsma_bounds[:, 0])
         self.register_buffer("sacsma_hi", sacsma_bounds[:, 1])
 
+    def _to_params(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raw = raw.to(torch.float64)
+        n_a = len(self.snow17_names)
+        raw_a, raw_b = raw[..., :n_a], raw[..., n_a:]
+        frac_a = torch.sigmoid(raw_a)
+        frac_b = torch.sigmoid(raw_b)
+        theta_A = (self.snow17_lo + frac_a * (self.snow17_hi - self.snow17_lo)).to(torch.float32)
+        theta_B = self.sacsma_lo + frac_b * (self.sacsma_hi - self.sacsma_lo)
+        return theta_A, theta_B
+
+
+class ParamNet(_BoundedParams):
+    """forward(x_static, x_climate) -> (theta_A, theta_B), see
+    _BoundedParams. x_climate: the (batch, 12, 3) monthly climatology."""
+
+    def __init__(
+        self,
+        n_static_features: int,
+        n_climate_features: int = 3,
+        lstm_hidden: int = 32,
+        mlp_hidden: int = 64,
+        n_hidden_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
         self.lstm = nn.LSTM(
             input_size=n_climate_features, hidden_size=lstm_hidden, batch_first=True
         ).double()
 
-        n_out = len(self.snow17_names) + len(self.sacsma_names)
         layers: list[nn.Module] = []
         in_dim = n_static_features + lstm_hidden
         for _ in range(n_hidden_layers):
             layers += [nn.Linear(in_dim, mlp_hidden), nn.ReLU(), nn.Dropout(dropout)]
             in_dim = mlp_hidden
-        layers += [nn.Linear(in_dim, n_out)]
+        layers += [nn.Linear(in_dim, self.n_params)]
         self.head = nn.Sequential(*layers).double()
 
     def forward(
@@ -151,12 +172,60 @@ class ParamNet(nn.Module):
         climate_embed = h_n[-1]  # (batch, lstm_hidden) -- final layer's final hidden state
 
         combined = torch.cat([x_static.to(torch.float64), climate_embed], dim=-1)
-        raw = self.head(combined)
+        return self._to_params(self.head(combined))
 
-        n_a = len(self.snow17_names)
-        raw_a, raw_b = raw[..., :n_a], raw[..., n_a:]
-        frac_a = torch.sigmoid(raw_a)
-        frac_b = torch.sigmoid(raw_b)
-        theta_A = (self.snow17_lo + frac_a * (self.snow17_hi - self.snow17_lo)).to(torch.float32)
-        theta_B = self.sacsma_lo + frac_b * (self.sacsma_hi - self.sacsma_lo)
-        return theta_A, theta_B
+
+class DailyParamNet(_BoundedParams):
+    """dHBV-style parameter LSTM (Feng et al., 2022), keeping this
+    project's ONE parameter set per basin.
+
+    forward(x_static, x_forcing) -> (theta_A, theta_B), see
+    _BoundedParams. x_forcing: (batch, T, 3) z-scored daily [prcp,
+    tmean, pet] over the split's whole training window
+    (data_module.train_period_forcing), the same sequence for every
+    window the basin is trained or evaluated on.
+
+    As in dHBV, the static attributes join the forcing at EVERY timestep,
+    then Linear + ReLU in, an LSTM, and Linear out. dHBV reads parameters
+    off the last timestep of the simulated window, so they shift with
+    each window's weather; here the readout is the mean over all T steps
+    instead -- every training year counts equally, and the parameters
+    stay a property of the basin (the recovered-parameter figures need
+    that). The mean is taken over hidden states before linear_out, which
+    is the same as averaging per-step outputs (linear_out is affine) at
+    1/T the memory. Dropout acts on that pooled state -- not dHBV's
+    DropConnect on the recurrent weights.
+
+    float32 inside (a 256-unit LSTM over ~3,300 days is ~60x slower in
+    float64 on consumer GPUs); only the bounded parameters are float64.
+
+    Memory scales with batch x T: a 100-basin training step over 3,288
+    days peaks at ~5.8 GB. Without gradients (evaluation, inference) the
+    forward runs EVAL_CHUNK basins at a time -- all 531 at once does not
+    fit on an 11 GB card."""
+
+    EVAL_CHUNK = 100
+
+    def __init__(
+        self, n_static_features: int, n_forcing_features: int = 3, hidden: int = 256, dropout: float = 0.5
+    ) -> None:
+        super().__init__()
+        self.linear_in = nn.Linear(n_forcing_features + n_static_features, hidden)
+        self.lstm = nn.LSTM(input_size=hidden, hidden_size=hidden, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.linear_out = nn.Linear(hidden, self.n_params)
+
+    def forward(
+        self, x_static: torch.Tensor, x_forcing: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not torch.is_grad_enabled() and x_static.shape[0] > self.EVAL_CHUNK:
+            parts = [
+                self(x_static[i : i + self.EVAL_CHUNK], x_forcing[i : i + self.EVAL_CHUNK])
+                for i in range(0, x_static.shape[0], self.EVAL_CHUNK)
+            ]
+            return torch.cat([a for a, _ in parts]), torch.cat([b for _, b in parts])
+        n_steps = x_forcing.shape[1]
+        x_static = x_static.to(torch.float32)[:, None, :].expand(-1, n_steps, -1)
+        x = torch.cat([x_forcing.to(torch.float32), x_static], dim=-1)
+        h, _ = self.lstm(torch.relu(self.linear_in(x)))  # (batch, T, hidden)
+        return self._to_params(self.linear_out(self.dropout(h.mean(dim=1))))

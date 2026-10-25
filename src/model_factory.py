@@ -28,11 +28,31 @@ def resolve_device(name: str) -> torch.device:
     return device
 
 
+MODEL_NAMES = ("hybrid", "hybrid_daily")
+
+
+def uses_daily_forcing(cfg) -> bool:
+    """Whether the network's sequence input (SplitData.X_climate) is the
+    training window's daily forcing (data_module.train_period_forcing)
+    rather than the monthly climatology."""
+    if cfg.model.name not in MODEL_NAMES:
+        raise ValueError(f"unknown model.name: {cfg.model.name!r} (expected one of {MODEL_NAMES})")
+    return cfg.model.name == "hybrid_daily"
+
+
 def build_model(cfg, n_static: int, n_climate: int) -> nn.Module:
-    """n_climate: ParamNet's climatology-sequence width (currently 3:
-    prcp/tmean/pet, see data/build_climatology.py)."""
-    if cfg.model.name != "hybrid":
-        raise ValueError(f"unknown model.name: {cfg.model.name!r} (expected 'hybrid')")
+    """n_climate: the width of the network's sequence input -- 3 for
+    both models (prcp/tmean/pet: monthly climatology, see
+    data/build_climatology.py, or daily forcing)."""
+    if uses_daily_forcing(cfg):
+        from paramnet import DailyParamNet
+
+        return DailyParamNet(
+            n_static_features=n_static,
+            n_forcing_features=n_climate,
+            hidden=cfg.model.hidden,
+            dropout=cfg.model.dropout,
+        )
 
     from paramnet import ParamNet
 

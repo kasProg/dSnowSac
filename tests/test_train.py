@@ -477,3 +477,189 @@ def test_resume_from_checkpoint_without_rng_state(tmp_path, monkeypatch):
     resume_cli(str(tmp_path), ["train.n_epochs=3"])
     rows = json.loads((tmp_path / "history.json").read_text())["history"]
     assert [row["epoch"] for row in rows] == [3]
+
+
+def test_rmse_comb_loss_matches_an_independent_recomputation_and_pools():
+    """Against numpy, from Feng et al. (2022)'s equation. Two basins of
+    different lengths and magnitudes: the RMSEs pool their days, so the
+    loss is NOT the mean of the per-basin losses."""
+    import torch
+
+    from data_module import rmse_comb_loss
+
+    rng = np.random.default_rng(0)
+    obs = [rng.gamma(2.0, 1.0, 50), rng.gamma(2.0, 5.0, 20)]
+    sim = [o * rng.uniform(0.5, 1.5, o.size) for o in obs]
+    obs[0][:3] = 0.0  # exact zeros: the transform must stay finite there
+    pairs = [(torch.tensor(s), torch.tensor(o)) for s, o in zip(sim, obs)]
+    alpha, beta = 0.25, 1e-6
+
+    def transform(q):
+        return np.log10(np.sqrt(q + beta) + 0.1)
+
+    s, o = np.concatenate(sim), np.concatenate(obs)
+    expected = (1 - alpha) * np.sqrt(np.mean((s - o) ** 2)) + alpha * np.sqrt(
+        np.mean((transform(s) - transform(o)) ** 2)
+    )
+    np.testing.assert_allclose(rmse_comb_loss(pairs, alpha, beta).item(), expected, rtol=1e-12)
+    per_basin = np.mean([rmse_comb_loss([p], alpha, beta).item() for p in pairs])
+    assert not np.isclose(per_basin, expected)
+    # alpha = 0: plain pooled RMSE.
+    np.testing.assert_allclose(rmse_comb_loss(pairs, 0.0, beta).item(), np.sqrt(np.mean((s - o) ** 2)), rtol=1e-12)
+
+
+def test_rmse_comb_gradient_is_finite_at_zero_flow():
+    """beta's job: d/dq sqrt(q) is infinite at q = 0, and SAC-SMA's TCI
+    is exactly 0 on dry days."""
+    import torch
+
+    from data_module import rmse_comb_loss
+
+    sim = torch.tensor([0.0, 0.0, 1.0, 3.0], dtype=torch.float64, requires_grad=True)
+    obs = torch.tensor([0.0, 0.2, 1.5, 2.0], dtype=torch.float64)
+    rmse_comb_loss([(sim, obs)]).backward()
+    assert torch.isfinite(sim.grad).all()
+    assert sim.grad[1] < 0  # under-predicting a low flow pulls sim up
+
+
+def test_training_loss_dispatch():
+    import torch
+
+    from train import training_loss
+
+    nse_losses = [torch.tensor(0.2), torch.tensor(0.6)]
+    pairs = [(torch.tensor([1.0, 2.0]), torch.tensor([1.5, 2.0]))]
+    for cfg in (None, {"name": "nse"}):
+        torch.testing.assert_close(training_loss(cfg, nse_losses, pairs), torch.tensor(0.4))
+    assert training_loss({"name": "rmse_comb", "alpha": 0.0}, nse_losses, pairs).item() == pytest.approx(
+        np.sqrt(0.125)
+    )
+    with pytest.raises(ValueError, match="unknown train.loss.name"):
+        training_loss({"name": "kge"}, nse_losses, pairs)
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_window_epoch_trains_on_rmse_comb_and_still_reports_nse():
+    """With loss.name=rmse_comb, each step's loss is rmse_comb_loss over
+    the sampled windows' scored days, while the returned per-window
+    values stay 1 - window NSE loss."""
+    import torch
+
+    from data_module import build_split, rmse_comb_loss, window_nse_loss, window_pair, window_starts
+    from paramnet import ParamNet
+    from physics_pool import PhysicsPool
+    from train import run_epoch_windows
+
+    split = build_split(_spatial_cfg())
+    basins = split.train_examples[:3]
+    warmup, rho = 30, 60
+    starts = {ex.key: window_starts(ex, warmup, rho) for ex in basins}
+    net = ParamNet(
+        n_static_features=split.X_static[basins[0].gauge_id].shape[0],
+        n_climate_features=split.X_climate[basins[0].gauge_id].shape[1],
+    )
+    optimizer = torch.optim.Adam(net.parameters(), lr=3e-3)
+    loss_cfg = {"name": "rmse_comb", "alpha": 0.25, "beta": 1e-6}
+    calls, step_losses = [], []
+    by_key = {ex.key: ex for ex in basins}
+
+    forcings = {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in basins}
+    with PhysicsPool(forcings, n_workers=0) as pool:
+        real_run = pool.run
+
+        def recording_run(tA, tB, keys, windows):
+            sims = real_run(tA, tB, keys, windows)
+            calls.append((list(keys), [w[0] for w in windows], [s.detach().clone() for s in sims]))
+            return sims
+
+        pool.run = recording_run
+        nses = run_epoch_windows(
+            net, pool, basins, split.X_static, split.X_climate, optimizer, starts,
+            batch_size=2, warmup=warmup, rho=rho, n_iters=2, rng=np.random.default_rng(0),
+            on_step=step_losses.append, loss_cfg=loss_cfg,
+        )
+
+    expected_nses = []
+    for (keys, t0s, sims), step_loss in zip(calls, step_losses):
+        exs = [by_key[k] for k in keys]
+        pairs = [window_pair(s, ex, t0, warmup) for ex, s, t0 in zip(exs, sims, t0s)]
+        np.testing.assert_allclose(step_loss, rmse_comb_loss(pairs, 0.25, 1e-6).item(), rtol=1e-10)
+        expected_nses += [1.0 - window_nse_loss(s, ex, t0, warmup).item() for ex, s, t0 in zip(exs, sims, t0s)]
+    np.testing.assert_allclose(nses, expected_nses, rtol=1e-10)
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_train_period_forcing_is_each_basins_training_window():
+    """DailyParamNet's input: raw CAMELS [prcp, tmean, pet] over the
+    TRAINING window for every basin -- test basins included, warmup days
+    dropped, and in a temporal split never the test window."""
+    import pandas as pd
+
+    from camels_loader import load_basin_timeseries
+    from data_module import build_split, forcing_normalization, normalize_forcing, train_period_forcing
+
+    def expected(gauge_id, start, end):
+        ts = load_basin_timeseries(gauge_id, all_forcing_days=True)
+        m = (ts.dates >= pd.Timestamp(start)) & (ts.dates <= pd.Timestamp(end))
+        return np.stack([ts.prcp[m], ts.tmean[m], ts.pet[m]], axis=1)
+
+    cfg = _spatial_cfg()
+    cfg.eval_warmup = 100
+    split = build_split(cfg)
+    forcing = train_period_forcing(split)
+    assert set(forcing) == set(split.train_ids) | set(split.test_ids)
+    for g in (split.train_ids[0], split.test_ids[0]):
+        np.testing.assert_array_equal(forcing[g], expected(g, "1990-10-01", "1993-09-30"))
+
+    mean, std = forcing_normalization(forcing, split.train_ids)
+    train_days = np.concatenate([forcing[g] for g in split.train_ids])
+    np.testing.assert_allclose(mean, train_days.mean(axis=0))
+    z = np.concatenate(list(normalize_forcing({g: forcing[g] for g in split.train_ids}, mean, std).values()))
+    np.testing.assert_allclose(z.mean(axis=0), 0.0, atol=1e-10)
+    np.testing.assert_allclose(z.std(axis=0), 1.0, rtol=1e-10)
+
+    cfg.split = {
+        "mode": "temporal",
+        "train_window": {"start": "1991-10-01", "end": "1992-09-30"},
+        "test_window": {"start": "1990-10-01", "end": "1991-09-30"},
+    }
+    split = build_split(cfg)
+    g = split.test_ids[0]
+    np.testing.assert_array_equal(train_period_forcing(split)[g], expected(g, "1991-10-01", "1992-09-30"))
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_daily_model_trains_and_infer_reproduces_its_test_predictions(tmp_path, monkeypatch):
+    """model=hybrid_daily end to end: a short training run, then
+    src/infer.py on its checkpoint must rebuild exactly the same network
+    inputs -- same training-window forcing, same saved scaling -- and so
+    the same test-basin simulations. A scaling or window mismatch here
+    would give plausible but wrong parameters, not an error."""
+    from hydra import compose, initialize_config_dir
+
+    from infer import run_inference
+    from train import run_training
+
+    monkeypatch.chdir(REPO_ROOT)
+    cfg = _small_run_cfg(tmp_path / "run", 1)
+    cfg.model = OmegaConf.load(REPO_ROOT / "configs" / "model" / "hybrid_daily.yaml")
+    cfg.model.hidden = 16
+    run_training(cfg)
+
+    with initialize_config_dir(version_base=None, config_dir=str(REPO_ROOT / "configs")):
+        infer_cfg = compose("infer", overrides=[
+            "data=camels_snow35", "split=spatial", "model=hybrid_daily", "model.hidden=16",
+            "eval_warmup=0", "n_workers=0", "device=cpu",
+            f"checkpoint={tmp_path / 'run' / 'checkpoint.pt'}", f"output_dir={tmp_path / 'infer'}",
+        ])
+    inferred = run_inference(infer_cfg)["predictions"]["test"]
+    trained = json.loads((tmp_path / "run" / "test_predictions.json").read_text())["predictions"]
+    assert set(inferred) == set(trained)
+    # Not bitwise: infer.py batches the test basins with the train ones,
+    # and the float32 network's kernels round differently by batch size
+    # (measured ~1e-6 relative in the sims). A wrong window or scaling
+    # moves the parameters by far more than 1e-4.
+    for g in trained:
+        np.testing.assert_allclose(
+            inferred[g]["sim_mm_day"], trained[g]["sim_mm_day"], rtol=1e-4, atol=1e-6
+        )

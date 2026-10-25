@@ -67,13 +67,19 @@ sys.path.insert(0, str(REPO_ROOT / "data"))
 from data_module import (  # noqa: E402
     BasinExample,
     build_split,
+    forcing_normalization,
     masked_nse_loss,
+    normalize_forcing,
     nse_value,
+    rmse_comb_loss,
     save_normalization,
+    scored_pair,
+    train_period_forcing,
     window_nse_loss,
+    window_pair,
     window_starts,
 )
-from model_factory import build_model, resolve_device  # noqa: E402
+from model_factory import build_model, resolve_device, uses_daily_forcing  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
 
 # Called after every optimizer step with that step's mean loss (progress bars).
@@ -90,6 +96,27 @@ def _network_inputs(basins, X_static: dict, X_climate: dict, device) -> tuple[to
     return x_static, x_climate
 
 
+LOSS_NAMES = ("nse", "rmse_comb")
+
+
+def loss_name(loss_cfg) -> str:
+    """train.loss.name, checked. None (configs predating the key) = nse."""
+    name = loss_cfg.get("name", "nse") if loss_cfg else "nse"
+    if name not in LOSS_NAMES:
+        raise ValueError(f"unknown train.loss.name: {name!r} (expected one of {LOSS_NAMES})")
+    return name
+
+
+def training_loss(loss_cfg, nse_losses: list[torch.Tensor], pairs: list[tuple]) -> torch.Tensor:
+    """The minibatch's one scalar training loss (configs/train/hybrid.yaml's
+    train.loss). nse: the mean over basins of each basin's NSE loss.
+    rmse_comb: data_module.rmse_comb_loss over the basins' pooled
+    (sim, obs) pairs. Train NSEs are reported either way."""
+    if loss_name(loss_cfg) == "nse":
+        return torch.stack(nse_losses).mean()
+    return rmse_comb_loss(pairs, alpha=loss_cfg.get("alpha", 0.25), beta=loss_cfg.get("beta", 1e-6))
+
+
 def run_epoch_hybrid(
     net,
     pool: PhysicsPool,
@@ -100,6 +127,7 @@ def run_epoch_hybrid(
     batch_size: int | None = None,
     rng: np.random.Generator | None = None,
     on_step: StepCallback | None = None,
+    loss_cfg=None,
 ) -> dict[str, float]:
     """Returns {gauge_id: nse}.
 
@@ -107,8 +135,8 @@ def run_epoch_hybrid(
     primal-only (no Jacobian). Otherwise one optimizer step per minibatch
     of `batch_size` basins, freshly shuffled by `rng` every call; with
     batch_size None (or >= len(basins)) one full-batch step in the given
-    basin order. Train NSEs are each basin's NSE at the parameters before
-    its minibatch's step.
+    basin order, on training_loss(loss_cfg, ...). Train NSEs are each
+    basin's NSE at the parameters before its minibatch's step.
 
     Inputs go to whatever device net lives on; the physics always runs on
     CPU (src/coupling.py's run_physics)."""
@@ -139,7 +167,7 @@ def run_epoch_hybrid(
         nses.update({ex.gauge_id: nse_value(sim, ex) for ex, sim in zip(batch, sims)})
 
         optimizer.zero_grad()
-        loss = torch.stack(losses).mean()
+        loss = training_loss(loss_cfg, losses, [scored_pair(sim, ex) for ex, sim in zip(batch, sims)])
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
         optimizer.step()
@@ -182,12 +210,15 @@ def run_epoch_windows(
     n_iters: int,
     rng: np.random.Generator,
     on_step: StepCallback | None = None,
+    loss_cfg=None,
 ) -> list[float]:
-    """n_iters gradient steps, each on batch_size distinct basins drawn
-    at random, each basin on a random window [s, s + warmup + rho) with s
-    drawn from starts[basin.key] (data_module.window_starts). Returns
-    1 - window loss for every sampled window, at the parameters before
-    its step -- an NSE normalized by the basin's whole-window variance."""
+    """n_iters gradient steps on training_loss(loss_cfg, ...), each on
+    batch_size distinct basins drawn at random, each basin on a random
+    window [s, s + warmup + rho) with s drawn from starts[basin.key]
+    (data_module.window_starts). Returns 1 - window NSE loss for every
+    sampled window, at the parameters before its step -- an NSE
+    normalized by the basin's whole-window variance, whatever the
+    training loss."""
     device = next(net.parameters()).device
     net.train()
     batch_size = min(batch_size or len(basins), len(basins))
@@ -204,7 +235,9 @@ def run_epoch_windows(
         nses += (1.0 - losses.detach().cpu()).tolist()
 
         optimizer.zero_grad()
-        loss = losses.mean()
+        loss = training_loss(
+            loss_cfg, list(losses), [window_pair(sim, ex, t0, warmup) for ex, sim, t0 in zip(batch, sims, t0s)]
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
         optimizer.step()
@@ -233,6 +266,14 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
         f"{cfg.get('eval_warmup', 0)} warmup days"
     )
 
+    forcing_stats = None
+    if uses_daily_forcing(cfg):
+        # Scaled by the training basins alone; saved for src/infer.py.
+        forcing = train_period_forcing(split)
+        forcing_stats = forcing_normalization(forcing, split.train_ids)
+        split.X_climate = normalize_forcing(forcing, *forcing_stats)
+        print(f"  network input: {len(forcing[split.train_ids[0]])} days of training-window daily forcing")
+
     n_static = split.X_static[split.train_ids[0]].shape[0]
     n_climate = split.X_climate[split.train_ids[0]].shape[1]
     # .get: manually built configs (tests, results/README.md snippets)
@@ -244,9 +285,11 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
 
     n_workers = cfg.get("n_workers", 0)
     batch_size = cfg.train.get("batch_size", None)
+    # .get: configs predating the key trained on nse.
+    loss_cfg = cfg.train.get("loss", None)
     print(
         f"  physics on {n_workers or 'no'} worker processes; "
-        f"batch_size={batch_size or 'all'} basins per gradient step"
+        f"batch_size={batch_size or 'all'} basins per gradient step; loss={loss_name(loss_cfg)}"
     )
     pool = PhysicsPool(
         {ex.key: (ex.snow17_forcing, ex.sacsma_forcing)
@@ -260,7 +303,7 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
     def run_epoch(basins, opt, on_step=None):
         return run_epoch_hybrid(
             net, pool, basins, split.X_static, split.X_climate, opt,
-            batch_size=batch_size, rng=rng, on_step=on_step,
+            batch_size=batch_size, rng=rng, on_step=on_step, loss_cfg=loss_cfg,
         )
 
     # Time-window minibatching -- see the module docstring. .get: configs
@@ -289,7 +332,7 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
             return run_epoch_windows(
                 net, pool, split.train_examples, split.X_static, split.X_climate, optimizer, starts,
                 batch_size=batch_size, warmup=warmup, rho=rho, n_iters=n_iters, rng=rng,
-                on_step=on_step,
+                on_step=on_step, loss_cfg=loss_cfg,
             )
     else:
         n_train = len(split.train_examples)
@@ -303,7 +346,7 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
     OmegaConf.save(cfg, output_dir / "config.yaml")
     # The feature scaling this network is trained on -- src/infer.py
     # re-scales other basin lists to it.
-    save_normalization(cfg.data, output_dir / "normalization.npz")
+    save_normalization(cfg.data, output_dir / "normalization.npz", forcing_stats)
     checkpoints_dir = output_dir / "checkpoints"
 
     # Progress (stderr; TQDM_DISABLE=1 turns it off). The run bar uses the
@@ -439,6 +482,7 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
         "n_epochs": cfg.train.n_epochs,
         "lr": cfg.train.lr,
         "batch_size": batch_size,
+        "loss": OmegaConf.to_container(loss_cfg) if loss_cfg else {"name": "nse"},
         "rho": rho,
         "warmup": warmup,
         "eval_warmup": cfg.get("eval_warmup", 0),
