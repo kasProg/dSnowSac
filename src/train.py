@@ -67,9 +67,10 @@ sys.path.insert(0, str(REPO_ROOT / "data"))
 from data_module import (  # noqa: E402
     BasinExample,
     build_split,
+    daily_inputs,
     forcing_normalization,
     masked_nse_loss,
-    normalize_forcing,
+    network_inputs,
     nse_value,
     rmse_comb_loss,
     save_normalization,
@@ -79,21 +80,11 @@ from data_module import (  # noqa: E402
     window_pair,
     window_starts,
 )
-from model_factory import build_model, resolve_device, uses_daily_forcing  # noqa: E402
+from model_factory import build_model, resolve_device, sequence_input, uses_daily_forcing  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
 
 # Called after every optimizer step with that step's mean loss (progress bars).
 StepCallback = Callable[[float], None]
-
-
-def _network_inputs(basins, X_static: dict, X_climate: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
-    x_static = torch.tensor(
-        np.stack([X_static[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
-    )
-    x_climate = torch.tensor(
-        np.stack([X_climate[b.gauge_id] for b in basins]), dtype=torch.float64, device=device
-    )
-    return x_static, x_climate
 
 
 LOSS_NAMES = ("nse", "rmse_comb")
@@ -145,8 +136,8 @@ def run_epoch_hybrid(
     if optimizer is None:
         net.eval()
         with torch.no_grad():
-            theta_A, theta_B = net(*_network_inputs(basins, X_static, X_climate, device))
-            sims = pool.run(theta_A, theta_B, [b.key for b in basins])
+            theta_A, theta_B = net(*network_inputs(basins, X_static, X_climate, device))
+            sims = pool.run_components(theta_A, theta_B, [b.key for b in basins])
         return {ex.gauge_id: nse_value(sim, ex) for ex, sim in zip(basins, sims)}
 
     net.train()
@@ -161,8 +152,8 @@ def run_epoch_hybrid(
     nses = {}
     for start in range(0, len(basins), batch_size):
         batch = [basins[i] for i in order[start : start + batch_size]]
-        theta_A, theta_B = net(*_network_inputs(batch, X_static, X_climate, device))
-        sims = pool.run(theta_A, theta_B, [b.key for b in batch])
+        theta_A, theta_B = net(*network_inputs(batch, X_static, X_climate, device))
+        sims = pool.run_components(theta_A, theta_B, [b.key for b in batch])
         losses = [masked_nse_loss(sim, ex) for ex, sim in zip(batch, sims)]
         nses.update({ex.gauge_id: nse_value(sim, ex) for ex, sim in zip(batch, sims)})
 
@@ -227,10 +218,9 @@ def run_epoch_windows(
     for _ in range(n_iters):
         batch = [basins[i] for i in rng.choice(len(basins), size=batch_size, replace=False)]
         t0s = [int(rng.choice(starts[ex.key])) for ex in batch]
-        theta_A, theta_B = net(*_network_inputs(batch, X_static, X_climate, device))
-        sims = pool.run(
-            theta_A, theta_B, [ex.key for ex in batch], [(t0, t0 + warmup + rho) for t0 in t0s]
-        )
+        windows = [(t0, t0 + warmup + rho) for t0 in t0s]
+        theta_A, theta_B = net(*network_inputs(batch, X_static, X_climate, device, windows))
+        sims = pool.run_components(theta_A, theta_B, [ex.key for ex in batch], windows)
         losses = torch.stack([window_nse_loss(sim, ex, t0, warmup) for ex, sim, t0 in zip(batch, sims, t0s)])
         nses += (1.0 - losses.detach().cpu()).tolist()
 
@@ -268,14 +258,17 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
 
     forcing_stats = None
     if uses_daily_forcing(cfg):
-        # Scaled by the training basins alone; saved for src/infer.py.
-        forcing = train_period_forcing(split)
-        forcing_stats = forcing_normalization(forcing, split.train_ids)
-        split.X_climate = normalize_forcing(forcing, *forcing_stats)
-        print(f"  network input: {len(forcing[split.train_ids[0]])} days of training-window daily forcing")
+        # Scaled by the training basins' training-window forcing alone;
+        # saved for src/infer.py.
+        forcing_stats = forcing_normalization(train_period_forcing(split), split.train_ids)
+        split.X_climate = daily_inputs(split, sequence_input(cfg), *forcing_stats)
+        print(
+            f"  network input: daily forcing ({sequence_input(cfg)}), "
+            f"{cfg.model.get('n_components', 1)} component(s) per basin"
+        )
 
     n_static = split.X_static[split.train_ids[0]].shape[0]
-    n_climate = split.X_climate[split.train_ids[0]].shape[1]
+    n_climate = network_inputs(split.train_examples[:1], split.X_static, split.X_climate, "cpu")[1].shape[2]
     # .get: manually built configs (tests, results/README.md snippets)
     # predate the device key.
     device = resolve_device(cfg.get("device", "cpu"))
@@ -452,9 +445,9 @@ def run_training(cfg: DictConfig, resume: bool = False) -> dict:
     predictions: dict[str, dict] = {}
     with torch.no_grad():
         theta_A_test, theta_B_test = net(
-            *_network_inputs(split.test_examples, split.X_static, split.X_climate, device)
+            *network_inputs(split.test_examples, split.X_static, split.X_climate, device)
         )
-        sims = pool.run(theta_A_test, theta_B_test, [ex.key for ex in split.test_examples])
+        sims = pool.run_components(theta_A_test, theta_B_test, [ex.key for ex in split.test_examples])
         for ex, sim in zip(split.test_examples, sims):
             predictions[ex.gauge_id] = {
                 "sim_mm_day": ex.scored(sim).cpu().numpy().tolist(),

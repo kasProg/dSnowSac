@@ -173,3 +173,51 @@ def test_daily_paramnet_chunked_eval_matches_one_batch():
         chunked_A, chunked_B = net(x_static, x_forcing)
     torch.testing.assert_close(chunked_A, whole_A)
     torch.testing.assert_close(chunked_B, whole_B)
+
+
+def test_daily_paramnet_components_shapes_bounds_and_independence():
+    """n_components = K: (batch, K, 11) / (batch, K, 16), all in bounds,
+    distinct sets per component, and still no mixing across basins."""
+    from paramnet import DailyParamNet
+
+    rng = np.random.default_rng(0)
+    torch.manual_seed(0)
+    net = DailyParamNet(n_static_features=N_STATIC, hidden=32, n_components=3, readout="last").eval()
+    x_static = torch.tensor(rng.normal(0, 1, (4, N_STATIC)), dtype=torch.float64)
+    x_forcing = torch.tensor(rng.normal(0, 1, (4, N_DAYS, 3)), dtype=torch.float64)
+    with torch.no_grad():
+        theta_A, theta_B = net(x_static * 50.0, x_forcing * 50.0)
+        alone_A, _ = net(x_static[1:2] * 50.0, x_forcing[1:2] * 50.0)
+        net.EVAL_CHUNK = 3
+        chunked_A, chunked_B = net(x_static * 50.0, x_forcing * 50.0)
+    assert theta_A.shape == (4, 3, 11) and theta_A.dtype == torch.float32
+    assert theta_B.shape == (4, 3, 16) and theta_B.dtype == torch.float64
+    for theta, names, bounds in (
+        (theta_A, net.snow17_names, SNOW17_BOUNDS),
+        (theta_B, net.sacsma_names, SACSMA_BOUNDS),
+    ):
+        lo = torch.tensor([bounds[n][0] for n in names], dtype=theta.dtype)
+        hi = torch.tensor([bounds[n][1] for n in names], dtype=theta.dtype)
+        assert torch.all(theta >= lo) and torch.all(theta <= hi)
+    assert not torch.allclose(theta_B[:, 0], theta_B[:, 1]), "components share one parameter set"
+    torch.testing.assert_close(alone_A[0], theta_A[1])
+    torch.testing.assert_close(chunked_A, theta_A)
+    torch.testing.assert_close(chunked_B, theta_B)
+
+
+def test_daily_paramnet_last_readout_reads_the_window_end():
+    """dHBV's readout: the parameters come from the last step, so the
+    final day moves them and the first of 400 days does not (the
+    opposite of the mean readout's test above)."""
+    from paramnet import DailyParamNet
+
+    rng = np.random.default_rng(0)
+    torch.manual_seed(0)
+    net = DailyParamNet(n_static_features=N_STATIC, hidden=32, dropout=0.0, readout="last")
+    x_static = torch.tensor(rng.normal(0, 1, (2, N_STATIC)), dtype=torch.float64)
+    x_forcing = torch.tensor(rng.normal(0, 1, (2, N_DAYS, 3)), dtype=torch.float64, requires_grad=True)
+    theta_A, theta_B = net(x_static, x_forcing)
+    (theta_A.double().sum() + theta_B.sum()).backward()
+    per_day = x_forcing.grad.abs().sum(dim=(0, 2))
+    assert per_day[-1] > 0
+    assert per_day[0] < 1e-6 * per_day[-1]

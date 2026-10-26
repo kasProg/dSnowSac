@@ -311,9 +311,10 @@ class SplitData:
     train_ids: list[str]
     test_ids: list[str]
     X_static: dict
-    # The network's sequence input by gauge_id: the monthly climatology,
-    # or for model=hybrid_daily the daily forcing train_period_forcing()
-    # returns, swapped in by src/train.py / src/infer.py.
+    # The network's sequence input: by gauge_id, the monthly climatology
+    # or (model=hybrid_daily) train_period_forcing()'s daily forcing; or
+    # (model=hybrid_dhbv) a WindowForcing. The daily ones are swapped in
+    # by src/train.py / src/infer.py -- see model_factory.sequence_input.
     X_climate: dict
 
 
@@ -336,10 +337,50 @@ def train_period_forcing(split: SplitData) -> dict[str, np.ndarray]:
             continue
         if (ex.window_start, ex.window_end) != (w0, w1):
             raise ValueError(f"{ex.gauge_id}: no example over the training window {w0.date()}..{w1.date()}")
-        x = np.stack([ex.snow17_forcing.pcp, ex.snow17_forcing.tmp, ex.sacsma_forcing.etp], axis=1)
-        forcing[ex.gauge_id] = x[ex.warmup :].astype(np.float64)
-        assert np.isfinite(forcing[ex.gauge_id]).all(), f"{ex.gauge_id}: non-finite forcing"
+        forcing[ex.gauge_id] = _run_forcing(ex)[ex.warmup :]
     return forcing
+
+
+def _run_forcing(example: BasinExample) -> np.ndarray:
+    """(warmup + window days, 3) raw [prcp, tmean, pet] the physics runs on."""
+    x = np.stack(
+        [example.snow17_forcing.pcp, example.snow17_forcing.tmp, example.sacsma_forcing.etp], axis=1
+    ).astype(np.float64)
+    assert np.isfinite(x).all(), f"{example.key}: non-finite forcing"
+    return x
+
+
+class WindowForcing:
+    """SplitData.X_climate for a network reading the SIMULATED window's
+    own forcing (DailyParamNet's "last" readout, model=hybrid_dhbv):
+    each example's z-scored run forcing, warmup included, sliced to the
+    window the physics runs -- the LSTM sees exactly the physics' days.
+    Scaled with forcing_normalization's training-basin statistics."""
+
+    def __init__(self, examples: list[BasinExample], mean: np.ndarray, std: np.ndarray):
+        self.by_key = {ex.key: (_run_forcing(ex) - mean) / std for ex in examples}
+
+    def sequence(self, example: BasinExample, window=None) -> np.ndarray:
+        x = self.by_key[example.key]
+        return x if window is None else x[window[0] : window[1]]
+
+
+def network_inputs(
+    basins: list[BasinExample], X_static: dict, X_climate, device, windows=None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(x_static, x_sequence) for one forward pass over `basins`.
+    X_climate is a per-gauge dict (climatology, or train_period_forcing:
+    the same sequence whatever the window) or a WindowForcing, sliced to
+    each basin's `windows` entry ([start, stop) into its run; None = the
+    whole run)."""
+    if isinstance(X_climate, WindowForcing):
+        seqs = [X_climate.sequence(ex, w) for ex, w in zip(basins, windows or [None] * len(basins))]
+    else:
+        seqs = [X_climate[ex.gauge_id] for ex in basins]
+    x_static = torch.tensor(
+        np.stack([X_static[ex.gauge_id] for ex in basins]), dtype=torch.float64, device=device
+    )
+    return x_static, torch.tensor(np.stack(seqs), dtype=torch.float64, device=device)
 
 
 def forcing_normalization(forcing: dict, gauge_ids: list[str]) -> tuple[np.ndarray, np.ndarray]:
@@ -353,6 +394,16 @@ def forcing_normalization(forcing: dict, gauge_ids: list[str]) -> tuple[np.ndarr
 
 def normalize_forcing(forcing: dict, mean: np.ndarray, std: np.ndarray) -> dict:
     return {g: (x - mean) / std for g, x in forcing.items()}
+
+
+def daily_inputs(split: SplitData, mode: str, mean: np.ndarray, std: np.ndarray):
+    """SplitData.X_climate for a daily-forcing model, scaled by (mean,
+    std): mode "train_period" or "window" -- model_factory.sequence_input."""
+    if mode == "window":
+        return WindowForcing(split.train_examples + split.test_examples, mean, std)
+    if mode == "train_period":
+        return normalize_forcing(train_period_forcing(split), mean, std)
+    raise ValueError(f"no daily input for sequence_input {mode!r}")
 
 
 def _build_examples(gauge_ids: list[str], start: str, end: str, warmup: int = 0) -> list[BasinExample]:

@@ -126,7 +126,7 @@ def test_minibatching_steps_once_per_minibatch_and_covers_every_basin():
     forcings = {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in basins}
     with PhysicsPool(forcings, n_workers=0) as pool:
         real_run = pool.run
-        pool.run = lambda tA, tB, keys: (batches.append(list(keys)), real_run(tA, tB, keys))[1]
+        pool.run = lambda tA, tB, keys, windows=None: (batches.append(list(keys)), real_run(tA, tB, keys, windows))[1]
         rng = np.random.default_rng(0)
         orders = []
         for _ in range(4):
@@ -663,3 +663,129 @@ def test_daily_model_trains_and_infer_reproduces_its_test_predictions(tmp_path, 
         np.testing.assert_allclose(
             inferred[g]["sim_mm_day"], trained[g]["sim_mm_day"], rtol=1e-4, atol=1e-6
         )
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_window_forcing_is_the_simulated_days():
+    """WindowForcing (model=hybrid_dhbv): the z-scored raw CAMELS forcing
+    of exactly the days the physics runs -- a sampled window of a train
+    example, or a test example's whole run including its warmup."""
+    import pandas as pd
+
+    from camels_loader import load_basin_timeseries
+    from data_module import WindowForcing, build_split, forcing_normalization, train_period_forcing
+
+    cfg = _spatial_cfg()
+    cfg.eval_warmup = 100
+    split = build_split(cfg)
+    mean, std = forcing_normalization(train_period_forcing(split), split.train_ids)
+    wf = WindowForcing(split.train_examples + split.test_examples, mean, std)
+
+    def expected(ex, start, n_days):
+        ts = load_basin_timeseries(ex.gauge_id, all_forcing_days=True)
+        i = int(np.searchsorted(ts.dates, start))
+        raw = np.stack([ts.prcp, ts.tmean, ts.pet], axis=1)[i : i + n_days]
+        return (raw - mean) / std
+
+    train_ex, test_ex = split.train_examples[0], split.test_examples[0]
+    np.testing.assert_allclose(
+        wf.sequence(train_ex, (200, 290)), expected(train_ex, pd.Timestamp("1990-10-01") + pd.Timedelta(days=200), 90)
+    )
+    n_run = 100 + len(test_ex.valid_mask)
+    np.testing.assert_allclose(wf.sequence(test_ex), expected(test_ex, pd.Timestamp("1990-10-01") - pd.Timedelta(days=100), n_run))
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_dhbv_window_epoch_feeds_each_window_and_runs_every_component():
+    """run_epoch_windows with the dHBV setup: the network's forcing input
+    for each basin is the window the physics simulates, and the physics
+    gets K rows per basin -- that basin's key, window and component k."""
+    import torch
+
+    from data_module import WindowForcing, build_split, forcing_normalization, train_period_forcing, window_starts
+    from paramnet import DailyParamNet
+    from physics_pool import PhysicsPool
+    from train import run_epoch_windows
+
+    split = build_split(_spatial_cfg())
+    basins = split.train_examples[:3]
+    warmup, rho, k = 30, 60, 2
+    mean, std = forcing_normalization(train_period_forcing(split), split.train_ids)
+    wf = WindowForcing(basins, mean, std)
+    starts = {ex.key: window_starts(ex, warmup, rho) for ex in basins}
+    torch.manual_seed(0)
+    net = DailyParamNet(split.X_static[basins[0].gauge_id].shape[0], hidden=8, n_components=k, readout="last")
+    seen_inputs, calls, thetas = [], [], []
+    net.register_forward_pre_hook(lambda _m, args: seen_inputs.append(args[1].detach().clone()))
+    net.register_forward_hook(lambda _m, _a, out: thetas.append(out[1].detach().clone()))
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+
+    with PhysicsPool({ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in basins}, n_workers=2) as pool:
+        real_run = pool.run
+
+        def recording_run(tA, tB, keys, windows=None):
+            calls.append((list(keys), list(windows), tB.detach().clone()))
+            return real_run(tA, tB, keys, windows)
+
+        pool.run = recording_run
+        nses = run_epoch_windows(
+            net, pool, basins, split.X_static, wf, optimizer, starts,
+            batch_size=2, warmup=warmup, rho=rho, n_iters=2, rng=np.random.default_rng(0),
+        )
+
+    by_key = {ex.key: ex for ex in basins}
+    assert len(calls) == len(seen_inputs) == 2 and len(nses) == 4 and all(np.isfinite(nses))
+    for (keys, windows, tB), x_forcing, theta_B in zip(calls, seen_inputs, thetas):
+        assert keys[0::k] == keys[1::k] and windows[0::k] == windows[1::k]
+        for i, (key, window) in enumerate(zip(keys[0::k], windows[0::k])):
+            assert window[1] - window[0] == warmup + rho
+            np.testing.assert_array_equal(x_forcing[i].numpy(), wf.sequence(by_key[key], window))
+        torch.testing.assert_close(tB, theta_B.reshape(-1, theta_B.shape[-1]))
+
+
+@pytest.mark.skipif(not _DATA_AVAILABLE, reason="CAMELS data not downloaded")
+def test_dhbv_model_trains_and_infer_reproduces_its_test_predictions(tmp_path, monkeypatch):
+    """model=hybrid_dhbv (window readout, 2 components) end to end, as
+    the hybrid_daily test above: infer.py must rebuild the same window
+    inputs and component runs, so the same test simulations."""
+    from hydra import compose, initialize_config_dir
+
+    from infer import run_inference
+    from train import run_training
+
+    monkeypatch.chdir(REPO_ROOT)
+    overrides = ["model.hidden=16", "model.n_components=2"]
+    cfg = _small_run_cfg(tmp_path / "run", 1)
+    cfg.model = OmegaConf.merge(
+        OmegaConf.load(REPO_ROOT / "configs" / "model" / "hybrid_dhbv.yaml"),
+        OmegaConf.from_dotlist([o.removeprefix("model.") for o in overrides]),
+    )
+    run_training(cfg)
+
+    with initialize_config_dir(version_base=None, config_dir=str(REPO_ROOT / "configs")):
+        infer_cfg = compose("infer", overrides=[
+            "data=camels_snow35", "split=spatial", "model=hybrid_dhbv", *overrides,
+            "eval_warmup=0", "n_workers=0", "device=cpu",
+            f"checkpoint={tmp_path / 'run' / 'checkpoint.pt'}", f"output_dir={tmp_path / 'infer'}",
+        ])
+    inferred = run_inference(infer_cfg)["predictions"]["test"]
+    trained = json.loads((tmp_path / "run" / "test_predictions.json").read_text())["predictions"]
+    assert set(inferred) == set(trained)
+    for g in trained:  # tolerance: see the hybrid_daily test
+        np.testing.assert_allclose(
+            inferred[g]["sim_mm_day"], trained[g]["sim_mm_day"], rtol=1e-4, atol=1e-6
+        )
+
+    # A temporal split with warmup: the train and test groups' window
+    # sequences differ in length, so infer.py must run them separately.
+    with initialize_config_dir(version_base=None, config_dir=str(REPO_ROOT / "configs")):
+        temporal_cfg = compose("infer", overrides=[
+            "data=camels_snow35", "split=temporal", "model=hybrid_dhbv", *overrides,
+            "split.train_window.start=1990-10-01", "split.train_window.end=1992-09-30",
+            "split.test_window.start=1992-10-01", "split.test_window.end=1995-09-30",
+            "eval_warmup=100", "n_workers=2", "device=cpu",
+            f"checkpoint={tmp_path / 'run' / 'checkpoint.pt'}", f"output_dir={tmp_path / 'infer_temporal'}",
+        ])
+    result = run_inference(temporal_cfg)["predictions"]
+    for group, n_days in (("train", 731), ("test", 1095)):
+        assert all(len(p["sim_mm_day"]) == n_days and np.isfinite(p["nse"]) for p in result[group].values())

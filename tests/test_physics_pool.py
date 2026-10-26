@@ -162,3 +162,46 @@ def test_tesseract_run_logs_do_not_accumulate(two_basins, n_workers):
         assert list(pool._stack._run_dir.iterdir()) == []
     else:
         assert not left, f"Tesseract run directories left behind: {left}"
+
+
+@pytest.mark.parametrize("n_workers", [0, 2])
+def test_run_components_averages_independent_runs(two_basins, n_workers):
+    """K = 2 components per basin: each basin's runoff must be the mean of
+    its own components' serial runs -- and each component's gradient its
+    own share of the loss. Basin 0's components are the two reference
+    parameter sets; basin 1's are the same pair swapped, so averaging
+    across basins or misordering components changes a gradient."""
+    stack, forcings, theta_A, theta_B = two_basins
+    comp_A = np.stack([theta_A, theta_A[::-1]])  # (basin, component, 11)
+    comp_B = np.stack([theta_B, theta_B[::-1]])
+
+    # Serial reference: every (basin, component) run on its own.
+    ref_A, ref_B = _leaves(comp_A, comp_B)
+    ref_sims = [
+        torch.stack([stack.run(ref_A[b, k], ref_B[b, k], *forcings[key]) for k in range(2)]).mean(dim=0)
+        for b, key in enumerate(("b0", "b1"))
+    ]
+    _loss(ref_sims).backward()
+
+    tA, tB = _leaves(comp_A, comp_B)
+    with PhysicsPool(forcings, n_workers=n_workers) as pool:
+        sims = pool.run_components(tA, tB, ["b0", "b1"])
+    _loss(sims).backward()
+
+    for sim, ref in zip(sims, ref_sims):
+        torch.testing.assert_close(sim.detach(), ref.detach(), rtol=1e-14, atol=0)
+    torch.testing.assert_close(tA.grad, ref_A.grad, rtol=1e-12, atol=0)
+    torch.testing.assert_close(tB.grad, ref_B.grad, rtol=1e-12, atol=0)
+    assert not torch.equal(tA.grad[0], tA.grad[1]), "per-basin loss weights not reflected"
+    assert all(tA.grad[b, k].abs().max() > 0 for b in range(2) for k in range(2))
+
+
+def test_run_components_with_one_set_is_run(two_basins):
+    stack, forcings, theta_A, theta_B = two_basins
+    tA, tB = _leaves(theta_A, theta_B)
+    with torch.no_grad(), PhysicsPool(forcings, n_workers=0) as pool:
+        plain = pool.run(tA, tB, ["b0", "b1"])
+        as_components = pool.run_components(tA[:, None], tB[:, None], ["b0", "b1"])
+        two_d = pool.run_components(tA, tB, ["b0", "b1"])
+    for p, c, d in zip(plain, as_components, two_d):
+        assert torch.equal(p, c) and torch.equal(p, d)

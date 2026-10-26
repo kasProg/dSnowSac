@@ -37,12 +37,12 @@ sys.path.insert(0, str(REPO_ROOT / "data"))
 from data_module import (  # noqa: E402
     apply_training_normalization,
     build_split,
+    daily_inputs,
     load_forcing_normalization,
-    normalize_forcing,
+    network_inputs,
     nse_value,
-    train_period_forcing,
 )
-from model_factory import build_model, resolve_device, uses_daily_forcing  # noqa: E402
+from model_factory import build_model, resolve_device, sequence_input, uses_daily_forcing  # noqa: E402
 from physics_pool import PhysicsPool  # noqa: E402
 
 
@@ -79,12 +79,10 @@ def run_inference(cfg: DictConfig) -> dict:
         )
     if uses_daily_forcing(cfg):
         # The training run's forcing statistics; there is no fallback.
-        split.X_climate = normalize_forcing(
-            train_period_forcing(split), *load_forcing_normalization(norm_path)
-        )
+        split.X_climate = daily_inputs(split, sequence_input(cfg), *load_forcing_normalization(norm_path))
 
     n_static = split.X_static[all_ids[0]].shape[0]
-    n_climate = split.X_climate[all_ids[0]].shape[1]
+    n_climate = network_inputs(all_examples[:1], split.X_static, split.X_climate, "cpu")[1].shape[2]
     device = resolve_device(cfg.get("device", "cpu"))
     net = build_model(cfg, n_static, n_climate)
     net.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
@@ -92,25 +90,22 @@ def run_inference(cfg: DictConfig) -> dict:
     n_workers = cfg.get("n_workers", 0)
     print(f"  network on {device}; physics on {n_workers or 'no'} worker processes")
 
-    x_static = torch.tensor(
-        np.stack([split.X_static[g] for g in all_ids]), dtype=torch.float64, device=device
-    )
-    x_climate = torch.tensor(
-        np.stack([split.X_climate[g] for g in all_ids]), dtype=torch.float64, device=device
-    )
-    # No gradients needed: one primal-only physics run per basin.
-    with torch.no_grad(), PhysicsPool(
-        {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in all_examples}, n_workers=n_workers
-    ) as pool:
-        theta_A, theta_B = net(x_static, x_climate)
-        sims = pool.run(theta_A, theta_B, [ex.key for ex in all_examples])
-
     # Grouped by train/test, not one dict keyed by gauge: in a temporal
     # split every basin appears in both groups (different windows), and
     # a flat dict let the test window silently overwrite the train one.
+    # The network runs once per group: a model reading each window's own
+    # forcing gets sequences of different lengths in the two groups.
     groups = {"train": split.train_examples, "test": split.test_examples}
     predictions: dict[str, dict[str, dict]] = {name: {} for name in groups}
-    sim_by_key = {ex.key: sim for ex, sim in zip(all_examples, sims)}
+    sim_by_key = {}
+    # No gradients needed: one primal-only physics run per basin and component.
+    with torch.no_grad(), PhysicsPool(
+        {ex.key: (ex.snow17_forcing, ex.sacsma_forcing) for ex in all_examples}, n_workers=n_workers
+    ) as pool:
+        for examples in groups.values():
+            theta_A, theta_B = net(*network_inputs(examples, split.X_static, split.X_climate, device))
+            sims = pool.run_components(theta_A, theta_B, [ex.key for ex in examples])
+            sim_by_key.update({ex.key: sim for ex, sim in zip(examples, sims)})
     for name, examples in groups.items():
         for ex in examples:
             sim = sim_by_key[ex.key]

@@ -108,7 +108,8 @@ def _worker_job(job: _Job):
 
 
 class PhysicsPool:
-    """`run(theta_A_batch, theta_B_batch, keys, windows=None) -> [runoff per basin]`.
+    """`run(theta_A_batch, theta_B_batch, keys, windows=None) -> [runoff per basin]`;
+    run_components() for parallel components per basin.
 
     n_workers=0 runs every job in this process (no subprocesses) through
     the same job function -- the reference path for tests and small runs.
@@ -168,7 +169,10 @@ class PhysicsPool:
             for dirs in per_basin
         ]
         if self._executor is not None:
-            results = list(self._executor.map(_worker_job, jobs))
+            # Several jobs per message: one per job made the main process
+            # the bottleneck at K x 27 jobs per basin (run_components).
+            chunksize = max(1, len(jobs) // (4 * self.n_workers))
+            results = list(self._executor.map(_worker_job, jobs, chunksize=chunksize))
         else:
             results = [_run_job(self._stack, self._forcings, job) for job in jobs]
 
@@ -185,6 +189,30 @@ class PhysicsPool:
             J_B = torch.stack(columns[n_a:], dim=1)
             runoffs.append(attach_jacobian(theta_A_batch[b], theta_B_batch[b], primal, J_A, J_B))
         return runoffs
+
+    def run_components(
+        self,
+        theta_A: torch.Tensor,
+        theta_B: torch.Tensor,
+        keys: list[str],
+        windows: list[Window] | None = None,
+    ) -> list[torch.Tensor]:
+        """run() for (B, 11)/(B, 16) thetas, or for (B, K, 11)/(B, K, 16):
+        K parallel components per basin (dHBV-style, src/paramnet.py's
+        DailyParamNet) -- K independent coupled runs on the same forcing,
+        each with its own parameters, and the basin's runoff is their
+        mean. Every component is its own row of one run() call, so the
+        Jacobian cost is K x 27 passes per basin."""
+        if theta_A.dim() == 2:
+            return self.run(theta_A, theta_B, keys, windows)
+        n_basins, k = theta_A.shape[:2]
+        sims = self.run(
+            theta_A.reshape(n_basins * k, -1),
+            theta_B.reshape(n_basins * k, -1),
+            [key for key in keys for _ in range(k)],
+            None if windows is None else [w for w in windows for _ in range(k)],
+        )
+        return [torch.stack(sims[b * k : (b + 1) * k]).mean(dim=0) for b in range(n_basins)]
 
     def close(self) -> None:
         if self._executor is not None:

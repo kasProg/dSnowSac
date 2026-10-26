@@ -7,3 +7,5 @@
 name: hybrid_daily
 hidden: 256
 dropout: 0.5
+n_components: 1
+readout: mean

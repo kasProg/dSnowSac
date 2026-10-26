@@ -176,25 +176,34 @@ class ParamNet(_BoundedParams):
 
 
 class DailyParamNet(_BoundedParams):
-    """dHBV-style parameter LSTM (Feng et al., 2022), keeping this
-    project's ONE parameter set per basin.
+    """dHBV-style parameter LSTM (Feng et al., 2022).
 
     forward(x_static, x_forcing) -> (theta_A, theta_B), see
-    _BoundedParams. x_forcing: (batch, T, 3) z-scored daily [prcp,
-    tmean, pet] over the split's whole training window
-    (data_module.train_period_forcing), the same sequence for every
-    window the basin is trained or evaluated on.
+    _BoundedParams; with n_components = K > 1, (batch, K, 11) and
+    (batch, K, 16): K parameter sets per basin, one per parallel
+    component (PhysicsPool.run_components averages their runoff).
+    x_forcing: (batch, T, 3) z-scored daily [prcp, tmean, pet].
 
     As in dHBV, the static attributes join the forcing at EVERY timestep,
-    then Linear + ReLU in, an LSTM, and Linear out. dHBV reads parameters
-    off the last timestep of the simulated window, so they shift with
-    each window's weather; here the readout is the mean over all T steps
-    instead -- every training year counts equally, and the parameters
-    stay a property of the basin (the recovered-parameter figures need
-    that). The mean is taken over hidden states before linear_out, which
-    is the same as averaging per-step outputs (linear_out is affine) at
-    1/T the memory. Dropout acts on that pooled state -- not dHBV's
-    DropConnect on the recurrent weights.
+    then Linear + ReLU in, an LSTM, and Linear out. Two readouts:
+
+      mean -- (model=hybrid_daily) x_forcing is the split's whole
+              training window (data_module.train_period_forcing), the
+              same for every window, read out as the mean over all T
+              steps: one parameter set per basin, every training year
+              counting equally -- what the recovered-parameter figures
+              need. The mean is taken over hidden states before
+              linear_out, which equals averaging per-step outputs
+              (linear_out is affine) at 1/T the memory.
+      last -- (model=hybrid_dhbv) dHBV's: x_forcing is the forcing of
+              the simulated window itself, warmup included
+              (data_module.WindowForcing), read out at its last step.
+              Parameters then shift with each window's weather; they
+              are still constant within a rollout, so the
+              finite-difference cost per component is unchanged.
+
+    Dropout acts on the read-out state -- not dHBV's DropConnect on the
+    recurrent weights.
 
     float32 inside (a 256-unit LSTM over ~3,300 days is ~60x slower in
     float64 on consumer GPUs); only the bounded parameters are float64.
@@ -206,14 +215,26 @@ class DailyParamNet(_BoundedParams):
 
     EVAL_CHUNK = 100
 
+    READOUTS = ("mean", "last")
+
     def __init__(
-        self, n_static_features: int, n_forcing_features: int = 3, hidden: int = 256, dropout: float = 0.5
+        self,
+        n_static_features: int,
+        n_forcing_features: int = 3,
+        hidden: int = 256,
+        dropout: float = 0.5,
+        n_components: int = 1,
+        readout: str = "mean",
     ) -> None:
         super().__init__()
+        if readout not in self.READOUTS:
+            raise ValueError(f"unknown readout {readout!r} (expected one of {self.READOUTS})")
+        self.n_components = n_components
+        self.readout = readout
         self.linear_in = nn.Linear(n_forcing_features + n_static_features, hidden)
         self.lstm = nn.LSTM(input_size=hidden, hidden_size=hidden, batch_first=True)
         self.dropout = nn.Dropout(dropout)
-        self.linear_out = nn.Linear(hidden, self.n_params)
+        self.linear_out = nn.Linear(hidden, self.n_params * n_components)
 
     def forward(
         self, x_static: torch.Tensor, x_forcing: torch.Tensor
@@ -228,4 +249,8 @@ class DailyParamNet(_BoundedParams):
         x_static = x_static.to(torch.float32)[:, None, :].expand(-1, n_steps, -1)
         x = torch.cat([x_forcing.to(torch.float32), x_static], dim=-1)
         h, _ = self.lstm(torch.relu(self.linear_in(x)))  # (batch, T, hidden)
-        return self._to_params(self.linear_out(self.dropout(h.mean(dim=1))))
+        state = h.mean(dim=1) if self.readout == "mean" else h[:, -1]
+        raw = self.linear_out(self.dropout(state))
+        if self.n_components > 1:
+            raw = raw.reshape(raw.shape[0], self.n_components, self.n_params)
+        return self._to_params(raw)

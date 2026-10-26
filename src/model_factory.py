@@ -28,16 +28,25 @@ def resolve_device(name: str) -> torch.device:
     return device
 
 
-MODEL_NAMES = ("hybrid", "hybrid_daily")
+MODEL_NAMES = ("hybrid", "hybrid_daily", "hybrid_dhbv")
 
 
 def uses_daily_forcing(cfg) -> bool:
-    """Whether the network's sequence input (SplitData.X_climate) is the
-    training window's daily forcing (data_module.train_period_forcing)
-    rather than the monthly climatology."""
+    """Whether the network reads daily forcing rather than the monthly
+    climatology -- see sequence_input() for which forcing."""
     if cfg.model.name not in MODEL_NAMES:
         raise ValueError(f"unknown model.name: {cfg.model.name!r} (expected one of {MODEL_NAMES})")
-    return cfg.model.name == "hybrid_daily"
+    return cfg.model.name != "hybrid"
+
+
+def sequence_input(cfg) -> str:
+    """What SplitData.X_climate must hold for this model: "climatology"
+    (monthly, per gauge), "train_period" (the training window's daily
+    forcing, per gauge: data_module.train_period_forcing) or "window"
+    (each simulated window's own daily forcing: data_module.WindowForcing)."""
+    if not uses_daily_forcing(cfg):
+        return "climatology"
+    return "window" if cfg.model.get("readout", "mean") == "last" else "train_period"
 
 
 def build_model(cfg, n_static: int, n_climate: int) -> nn.Module:
@@ -52,6 +61,9 @@ def build_model(cfg, n_static: int, n_climate: int) -> nn.Module:
             n_forcing_features=n_climate,
             hidden=cfg.model.hidden,
             dropout=cfg.model.dropout,
+            # .get: hybrid_daily runs saved before these keys used 1 and mean.
+            n_components=cfg.model.get("n_components", 1),
+            readout=cfg.model.get("readout", "mean"),
         )
 
     from paramnet import ParamNet

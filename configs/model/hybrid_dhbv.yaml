@@ -1,0 +1,16 @@
+# src/paramnet.py's DailyParamNet set up like dHBV (Feng et al., 2022):
+# the LSTM reads each simulated window's own daily forcing (warmup
+# included) and its last step gives the parameters, so they shift with
+# each window's weather; n_components parallel Snow17 -> SAC-SMA chains
+# per basin, runoff averaged. Still no routing.
+#
+# Cost: the physics Jacobian is n_components x 27 passes per basin.
+# Measured at 16 components (camels_531, 100 basins x 730-day windows,
+# 52-core server): ~27 s per step at n_workers=32, ~20 s at 96 -- with
+# 194 steps, ~65-87 min per epoch, ~3-4 days for 60 epochs. Physical
+# cores cap n_workers' benefit; fewer components cost proportionally less.
+name: hybrid_dhbv
+hidden: 256
+dropout: 0.5
+n_components: 16
+readout: last
