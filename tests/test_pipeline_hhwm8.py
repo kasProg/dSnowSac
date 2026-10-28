@@ -225,9 +225,11 @@ def test_coupled_gradient_rollout_budget(hhwm8_setup, monkeypatch):
 
     The failure this catches is silent -- gradients stay correct, only the
     run count explodes. tesseract-torch hands each jacobian_vector_product
-    every differentiable input, zero tangents included; without the
-    zero-tangent filter in both tesseract_api.py files the HHWM8 water year
-    cost 513 Snow17 + 729 SAC-SMA rollouts (vs 49 + 77 with it).
+    every differentiable input, zero tangents included; tesseract-core
+    1.15.0's finite_difference_jvp spent a central pair on each of them,
+    and the HHWM8 water year cost 513 Snow17 + 729 SAC-SMA rollouts. Since
+    pasteurlabs/tesseract-core#873 the helper skips zero-tangent groups:
+    65 + 79.
     """
     import sacsma
     import snow17
@@ -252,8 +254,10 @@ def test_coupled_gradient_rollout_budget(hhwm8_setup, monkeypatch):
     stack.run(theta_A, theta_B, snow17_forcing, sacsma_forcing).sum().backward()
 
     n_a, n_b = len(SNOW17_PARAMS), len(SACSMA_PARAMS)
-    # Snow17: plain + central pair on its own passes, plain only on SAC-SMA's.
-    # SAC-SMA: plain + central pair on every pass (fewer when a Snow17
-    # parameter has exactly zero effect on RAIM, e.g. SI/PXTEMP here).
-    assert 0 < counts["snow17"] <= 3 * n_a + n_b, counts
+    # Snow17: plain + central pair on its own passes; on SAC-SMA's, plain +
+    # the one base run the helper makes for output shapes when every
+    # tangent is zero.
+    # SAC-SMA: plain + central pair on every pass (plain + base run when a
+    # Snow17 parameter has exactly zero effect on RAIM, e.g. SI/PXTEMP here).
+    assert 0 < counts["snow17"] <= 3 * n_a + 2 * n_b, counts
     assert 0 < counts["sacsma"] <= 3 * (n_a + n_b), counts

@@ -2,7 +2,10 @@ numpy
 pandas
 pytest
 torch
-tesseract-core[runtime]>=1.15  # 1.14: per-input FD eps; 1.15: cached gradient-endpoint validators (~4x faster JVPs)
+# 1.14: per-input FD eps; 1.15: cached gradient-endpoint validators (~4x faster JVPs);
+# f448c301 (#873, unreleased): finite_difference_jvp skips zero-tangent groups.
+# Swap for tesseract-core[runtime]>=<first release containing #873> once it's on PyPI.
+tesseract-core[runtime] @ git+https://github.com/pasteurlabs/tesseract-core@f448c3015fd624eb27d43c8884fa4b704d1ba7bd
 tesseract-torch
 hydra-core
 tqdm

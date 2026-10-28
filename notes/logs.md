@@ -1655,3 +1655,42 @@ held-out 0.730 (was 0.704). Per basin 5 up / 5 down, mean held-out 0.62
 (was 0.66), `13313000` 0.33 → -0.02. Reported as a reproduction within
 run-to-run variation, not an improvement. Kept `model_9yrs_spatial` as the
 README headline. Cost in practice: 50.4 s/epoch (was 4.7), 126 min total.
+
+## 2026-10-28 — Zero-tangent filter removed: fixed upstream (tesseract-core #873)
+
+**Upstream:** the 09-27 entry's "arguably belongs upstream" became our PR,
+merged as pasteurlabs/tesseract-core#873 (`f448c301`).
+`finite_difference_jvp` now drops eps groups whose tangents are all zero
+before differencing. It isn't released yet (PyPI latest is 1.15.0), so
+`requirements.txt` and the CI install pin the commit by full SHA. That's
+enough for the containers too: `tesseract build` copies the host's
+installed `tesseract_core/runtime` into the image.
+
+**Removed** the filter from both `jacobian_vector_product` endpoints;
+they pass `jvp_inputs` and `tangent_vector` straight to the helper again.
+
+**Measured** (HHWM8 water year, one forward+backward):
+
+| | Snow17 | SAC-SMA | wall |
+|---|---|---|---|
+| 1.15.0, no filter | 513 | 729 | 2.84 s |
+| 1.15.0, our filter | 49 | 77 | 0.87 s |
+| `f448c301`, our filter | 49 | 77 | 0.64 s |
+| `f448c301`, no filter (adopted) | 65 | 79 | 0.66 s |
+
+Gradients are bitwise identical across all of the filtered/fixed rows.
+The extra 16 + 2 rollouts are passes where every tangent is zero (the 16
+SAC-SMA-parameter passes for Snow17; SI/PXTEMP, which leave RAIM exactly
+unchanged, for SAC-SMA). Upstream still makes one base run there for
+output shapes, where our filter returned zeros for free. No measurable wall
+time difference, so we accept it for 30 fewer lines. Skipping the call
+entirely belongs in tesseract-torch (treat all-zero tangents like `None`),
+which is a possible follow-up.
+
+**Budget test:** the Snow17 bound is `3*n_a + 2*n_b` (was `3*n_a + n_b`).
+Checked that it fails on 1.15.0 without the filter (513 > 65). Full suite
+passes on `f448c301`: 133 passed, 2 skipped (the Docker image tests, as
+before).
+
+**TODO:** once a release containing #873 is on PyPI, swap the git pin for
+`>=` that release in `requirements.txt` and `ci.yml`.
